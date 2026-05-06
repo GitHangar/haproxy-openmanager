@@ -350,16 +350,38 @@ class ACMEService:
 
             order_id = order_row['id']
 
+            # Commit 5e: track authorization fetch outcomes per-domain.
+            # Previously a 'continue' on auth fetch failure silently dropped HTTP-01
+            # challenges; the order proceeded but had no challenges to respond to,
+            # leaving it stuck in 'pending' forever.
+            auth_fetch_failures = []  # [{auth_url, http_status, error}]
+            domains_with_http01 = set()
+            
             for auth_url in data.get('authorizations', []):
-                auth_status, auth_data, _ = await self._signed_request(
-                    auth_url, account['directory_url'], private_key, "",
-                    account_url=account['account_url'],
-                )
+                try:
+                    auth_status, auth_data, _ = await self._signed_request(
+                        auth_url, account['directory_url'], private_key, "",
+                        account_url=account['account_url'],
+                    )
+                except Exception as auth_err:
+                    logger.warning(f"ACME: authorization fetch raised: {auth_url} - {auth_err}")
+                    auth_fetch_failures.append({
+                        "auth_url": auth_url, "http_status": None, "error": str(auth_err)
+                    })
+                    continue
+                
                 if auth_status != 200:
-                    logger.warning(f"Failed to fetch authorization {auth_url}: HTTP {auth_status}")
+                    logger.warning(
+                        f"ACME: Failed to fetch authorization {auth_url}: HTTP {auth_status}, body={str(auth_data)[:200]}"
+                    )
+                    auth_fetch_failures.append({
+                        "auth_url": auth_url, "http_status": auth_status,
+                        "error": str(auth_data)[:500] if auth_data else ""
+                    })
                     continue
 
                 domain = (auth_data.get('identifier') or {}).get('value', '')
+                http01_for_domain = False
                 for challenge in (auth_data.get('challenges') or []):
                     if challenge.get('type') == 'http-01':
                         token = challenge['token']
@@ -373,6 +395,43 @@ class ACMEService:
                         """, order_id, domain, token, key_auth,
                             challenge.get('url') or '', challenge.get('status') or 'pending')
                         logger.info(f"ACME: Challenge stored for domain={domain}, token={token[:20]}..., challenge_url={(challenge.get('url') or '')[:60]}")
+                        http01_for_domain = True
+                if http01_for_domain and domain:
+                    domains_with_http01.add(domain)
+            
+            # If NO http-01 challenges were registered at all, the order cannot
+            # proceed — fail-fast and persist diagnostic detail.
+            if not domains_with_http01:
+                error_payload = json.dumps({
+                    "stage": "create_order_authorizations",
+                    "auth_fetch_failures": auth_fetch_failures,
+                    "domains": domains,
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+                await conn.execute(
+                    "UPDATE letsencrypt_orders SET status = 'invalid', error_detail = $1, updated_at = NOW() WHERE id = $2",
+                    error_payload, order_id
+                )
+                raise Exception(
+                    f"ACME order {order_id} created but no http-01 challenges available "
+                    f"(auth fetch failures: {len(auth_fetch_failures)}). See order.error_detail for diagnostics."
+                )
+            elif auth_fetch_failures:
+                # Partial failure: some domains have challenges, others don't. Record warning.
+                error_payload = json.dumps({
+                    "stage": "create_order_authorizations_partial",
+                    "auth_fetch_failures": auth_fetch_failures,
+                    "domains_with_challenges": sorted(domains_with_http01),
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+                await conn.execute(
+                    "UPDATE letsencrypt_orders SET error_detail = $1, updated_at = NOW() WHERE id = $2",
+                    error_payload, order_id
+                )
+                logger.warning(
+                    f"ACME order {order_id}: partial authorization fetch failure — "
+                    f"{len(auth_fetch_failures)} failed, {len(domains_with_http01)} succeeded"
+                )
 
             return {
                 "order_id": order_id,
@@ -388,8 +447,12 @@ class ACMEService:
     async def respond_to_challenges(self, order_id: int) -> List[dict]:
         conn = await get_database_connection()
         try:
+            # Issue #12 / Commit 5a: include 'failed' challenges so they can be retried,
+            # but rate-limit per challenge: max 5 attempts in last 5 minutes.
             challenges = await conn.fetch(
-                "SELECT * FROM acme_challenges WHERE order_id = $1 AND (status = 'pending' OR status IS NULL)",
+                """SELECT * FROM acme_challenges
+                   WHERE order_id = $1
+                     AND (status IN ('pending', 'failed') OR status IS NULL)""",
                 order_id
             )
             order = await conn.fetchrow(
@@ -407,6 +470,22 @@ class ACMEService:
                 if not ch['challenge_url']:
                     logger.warning(f"ACME: Skipping challenge id={ch['id']} domain={ch['domain']} - no challenge_url")
                     continue
+                
+                # Rate-limit retry: skip if attempted >=5 times in last 5 minutes
+                attempts = ch.get('attempts') or 0
+                last_attempt = ch.get('last_attempt_at')
+                if attempts >= 5 and last_attempt:
+                    age_seconds = (datetime.utcnow().replace(tzinfo=None) -
+                                   (last_attempt.replace(tzinfo=None) if last_attempt.tzinfo else last_attempt)).total_seconds()
+                    if age_seconds < 300:
+                        logger.warning(
+                            f"ACME: Rate-limit: skipping challenge id={ch['id']} domain={ch['domain']} "
+                            f"(attempts={attempts}, age={int(age_seconds)}s < 300s)"
+                        )
+                        results.append({"domain": ch['domain'], "token": ch['token'],
+                                        "status": ch['status'], "skipped": "rate-limit"})
+                        continue
+                
                 status, data, _ = await self._signed_request(
                     ch['challenge_url'],
                     order['directory_url'],
@@ -417,7 +496,11 @@ class ACMEService:
                 new_status = (data.get('status') or 'processing') if status == 200 else 'failed'
                 logger.info(f"ACME: Challenge response for domain={ch['domain']}, token={ch['token'][:20]}..., CA_HTTP={status}, CA_status_raw={data.get('status')!r}, stored_status={new_status}")
                 await conn.execute(
-                    "UPDATE acme_challenges SET status = $1 WHERE id = $2",
+                    """UPDATE acme_challenges
+                       SET status = $1,
+                           attempts = COALESCE(attempts, 0) + 1,
+                           last_attempt_at = NOW()
+                       WHERE id = $2""",
                     new_status, ch['id']
                 )
                 results.append({"domain": ch['domain'], "token": ch['token'], "status": new_status})
@@ -472,11 +555,19 @@ class ACMEService:
             )
 
             if status not in (200, 201):
-                error_msg = data.get('detail') or str(data)
+                # Commit 5h: structured JSON-as-TEXT error_detail for consistency
+                # with check_order_status (5c) and download_certificate (5i).
+                error_msg = data.get('detail') if isinstance(data, dict) else str(data)
+                error_payload = json.dumps({
+                    "stage": "finalize_order",
+                    "http_status": status,
+                    "ca_response": data if isinstance(data, dict) else str(data)[:1000],
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
                 logger.error(f"ACME: Finalize failed for order_id={order_id}: HTTP {status}, error={error_msg}")
                 await conn.execute(
                     "UPDATE letsencrypt_orders SET status = 'invalid', error_detail = $1, updated_at = NOW() WHERE id = $2",
-                    error_msg, order_id
+                    error_payload, order_id
                 )
                 raise Exception(f"Finalize failed: {error_msg}")
 
@@ -521,9 +612,43 @@ class ACMEService:
             )
 
             if status != 200:
+                # Commit 5i: persist structured error_detail to TEXT column.
+                # Previously download failures only raised an exception, leaving the
+                # order in 'valid' state with no DB diagnostic — operators were
+                # blind to root cause.
+                try:
+                    error_payload = json.dumps({
+                        "stage": "download_certificate",
+                        "http_status": status,
+                        "ca_response": data if isinstance(data, dict) else str(data)[:1000],
+                        "timestamp": datetime.utcnow().isoformat(),
+                    })
+                    await conn.execute(
+                        "UPDATE letsencrypt_orders SET error_detail = $1, updated_at = NOW() WHERE id = $2",
+                        error_payload, order_id
+                    )
+                except Exception as persist_err:
+                    logger.warning(f"ACME: failed to persist download error for order {order_id}: {persist_err}")
                 raise Exception(f"Certificate download failed: HTTP {status}")
 
-            cert_pem = data.get('raw', '') if isinstance(data, dict) else str(data)
+            # Commit 5d: harden response parsing. ACME RFC 8555 §7.4.2 specifies
+            # `application/pem-certificate-chain` as the Content-Type. Some test
+            # CAs (Pebble) return raw PEM, others return JSON-wrapped data. We
+            # accept either format and extract the PEM body robustly.
+            cert_pem = ''
+            if isinstance(data, dict):
+                cert_pem = data.get('raw', '') or data.get('certificate', '') or ''
+            elif isinstance(data, (str, bytes)):
+                cert_pem = data.decode('utf-8') if isinstance(data, bytes) else data
+            elif data is not None:
+                cert_pem = str(data)
+            
+            if not cert_pem or '-----BEGIN CERTIFICATE-----' not in cert_pem:
+                raise Exception(
+                    f"Certificate download succeeded (HTTP 200) but response body "
+                    f"does not contain a PEM certificate. Content-Type={headers.get('Content-Type', 'unknown') if headers else 'unknown'}, "
+                    f"body_len={len(cert_pem) if cert_pem else 0}"
+                )
 
             parts = cert_pem.strip().split('-----END CERTIFICATE-----')
             certificate = (parts[0] + '-----END CERTIFICATE-----').strip() if parts else cert_pem
@@ -575,6 +700,26 @@ class ACMEService:
                     new_status, certificate_url, order_id
                 )
                 return {"order_id": order_id, "status": new_status, "certificate_url": certificate_url}
+
+            # Commit 5c: persist CA error to error_detail (TEXT) as structured JSON.
+            # Previously a non-200 was silently swallowed (no log, no DB record),
+            # leaving operators without diagnostic info for stuck orders.
+            try:
+                error_payload = json.dumps({
+                    "stage": "check_order_status",
+                    "http_status": status,
+                    "ca_response": data if isinstance(data, dict) else str(data)[:1000],
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+                await conn.execute(
+                    "UPDATE letsencrypt_orders SET error_detail = $1, updated_at = NOW() WHERE id = $2",
+                    error_payload, order_id
+                )
+            except Exception as persist_err:
+                logger.warning(f"ACME: failed to persist error_detail for order {order_id}: {persist_err}")
+            logger.warning(
+                f"ACME: check_order_status non-200 for order {order_id}: HTTP {status}, response={data}"
+            )
 
             return {"order_id": order_id, "status": order['status']}
         finally:

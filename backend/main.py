@@ -8,7 +8,7 @@ import redis
 import asyncio
 from datetime import datetime, timedelta
 
-_version_info = {"version": "1.3.0", "releaseName": "Bulk Import Change Detection + Multi-Select Delete", "releaseDate": "2026-04-14"}
+_version_info = {"version": "1.4.0", "releaseName": "ACME Stability & Enterprise Audit", "releaseDate": "2026-05-06"}
 for _vpath in ["/app/version.json", os.path.join(os.path.dirname(__file__), "..", "version.json")]:
     try:
         with open(_vpath) as _vf:
@@ -17,6 +17,7 @@ for _vpath in ["/app/version.json", os.path.join(os.path.dirname(__file__), ".."
     except (FileNotFoundError, json.JSONDecodeError):
         continue
 
+# Version: 2026-05-06 - ACME Stability & Enterprise Audit v1.4.0 (Issues #10, #11, #12)
 # Version: 2026-04-02 - Dark Mode + UI Improvements v1.2.0
 # Version: 2026-04-01 - ACME Auto SSL v1.1.0
 # Version: 2025-10-20 - Agent script fixes deployed
@@ -249,8 +250,109 @@ async def monitor_agent_status():
         await asyncio.sleep(30)
 
 # Background task for ACME certificate auto-renewal
+async def complete_pending_acme_orders():
+    """
+    Issue #12 fix: Auto-complete CA-validated ACME orders independent of
+    `acme.auto_renew_enabled` flag.
+    
+    Runs every 60s. Polls in-progress orders (pending/processing/ready, plus
+    valid-without-cert) and drives them through finalize -> download -> save
+    certificate. Without this task, orders that reach `valid` state at the CA
+    but have not yet been downloaded remain "stuck" and require manual
+    intervention via the UI.
+    
+    Multi-replica safety: uses PostgreSQL `FOR UPDATE SKIP LOCKED` atomic claim
+    plus updated_at timestamp filter to avoid two replicas working the same order.
+    """
+    await asyncio.sleep(60)
+    while True:
+        try:
+            conn_check = await get_database_connection()
+            try:
+                table_exists = await conn_check.fetchval("""
+                    SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'letsencrypt_orders')
+                """)
+            finally:
+                await close_database_connection(conn_check)
+            if not table_exists:
+                await asyncio.sleep(60)
+                continue
+
+            from routers.letsencrypt import _complete_certificate
+            from services.acme_service import acme_service as acme_svc
+            
+            # Atomic claim of orders for completion (multi-replica safe).
+            # Limit batch to 50 to avoid one replica monopolizing CA rate-limit budget.
+            claimed_ids = []
+            conn_claim = await get_database_connection()
+            try:
+                async with conn_claim.transaction():
+                    rows = await conn_claim.fetch("""
+                        SELECT id FROM letsencrypt_orders
+                        WHERE (
+                            status IN ('pending', 'processing', 'ready')
+                            OR (status = 'valid' AND ssl_certificate_id IS NULL)
+                        )
+                        AND created_at > NOW() - INTERVAL '7 days'
+                        AND (updated_at IS NULL OR updated_at < NOW() - INTERVAL '30 seconds')
+                        ORDER BY created_at
+                        LIMIT 50
+                        FOR UPDATE SKIP LOCKED
+                    """)
+                    if rows:
+                        claimed_ids = [r['id'] for r in rows]
+                        # Bump updated_at to mark claim (other replicas skip these for >=30s)
+                        await conn_claim.execute(
+                            "UPDATE letsencrypt_orders SET updated_at = NOW() WHERE id = ANY($1::int[])",
+                            claimed_ids
+                        )
+            finally:
+                await close_database_connection(conn_claim)
+            
+            if not claimed_ids:
+                await asyncio.sleep(60)
+                continue
+            
+            logger.info(f"[ACME-COMPLETE] Claimed {len(claimed_ids)} order(s) for completion: {claimed_ids}")
+            
+            for oid in claimed_ids:
+                try:
+                    status_info = await acme_svc.check_order_status(oid)
+                    current_status = status_info.get('status')
+
+                    if current_status == 'ready':
+                        await acme_svc.finalize_order(oid)
+                        status_info = await acme_svc.check_order_status(oid)
+                        current_status = status_info.get('status')
+
+                    if current_status == 'valid' and status_info.get('certificate_url'):
+                        result = await _complete_certificate(oid)
+                        logger.info(f"[ACME-COMPLETE] Order {oid} completed - {result.get('message', '')}")
+                    elif current_status == 'invalid':
+                        logger.warning(f"[ACME-COMPLETE] Order {oid} is invalid, skipping")
+                    elif current_status in ('pending', 'processing'):
+                        logger.info(f"[ACME-COMPLETE] Order {oid} still {current_status}, will retry next cycle")
+                except Exception as poll_err:
+                    logger.error(f"[ACME-COMPLETE] Failed to complete order {oid}: {poll_err}")
+
+        except Exception as e:
+            logger.error(f"[ACME-COMPLETE] Error in completion task: {e}")
+        await asyncio.sleep(60)
+
+
 async def check_letsencrypt_renewals():
-    """Background task to auto-renew expiring ACME certificates."""
+    """
+    Background task to auto-renew expiring ACME certificates.
+    
+    Runs every 60 minutes. Two-phase:
+    1. Create new orders for certificates expiring within `acme.renew_before_days`
+       (default 30). Gated by `acme.auto_renew_enabled` setting.
+    2. Warn about stuck orders (>24h in pending/processing state).
+    
+    Order completion (download cert + save to DB) is handled by the separate
+    `complete_pending_acme_orders` task running every 60s, so renewal pickup
+    is fast even if this hourly task is throttled.
+    """
     await asyncio.sleep(120)
     while True:
         conn = None
@@ -303,10 +405,9 @@ async def check_letsencrypt_renewals():
             await close_database_connection(conn)
             conn = None
 
-            from routers.letsencrypt import _complete_certificate
             from services.acme_service import acme_service as acme_svc
 
-            # --- Phase 1: Create new orders for expiring certificates ---
+            # Phase 1: Create new orders for expiring certificates
             for cert in expiring_certs:
                 try:
                     order_id = cert['letsencrypt_order_id']
@@ -334,7 +435,7 @@ async def check_letsencrypt_renewals():
                                 LIMIT 1
                             """, json.dumps(domains))
                             if existing:
-                                logger.info(f"ACME RENEWAL: Skipping cert {cert['id']} - order {existing['id']} already in progress")
+                                logger.info(f"[ACME-RENEWAL] Skipping cert {cert['id']} - order {existing['id']} already in progress")
                                 skip = True
                     finally:
                         await close_database_connection(conn2)
@@ -344,47 +445,11 @@ async def check_letsencrypt_renewals():
 
                     new_order = await acme_svc.create_order(order['account_id'], domains, cluster_ids)
                     await acme_svc.respond_to_challenges(new_order['order_id'])
-                    logger.info(f"ACME RENEWAL: Initiated renewal order {new_order['order_id']} for cert {cert['id']} ({cert['name']})")
+                    logger.info(f"[ACME-RENEWAL] Initiated renewal order {new_order['order_id']} for cert {cert['id']} ({cert['name']})")
                 except Exception as cert_err:
-                    logger.error(f"ACME RENEWAL ERROR: Failed to initiate renewal for cert {cert['id']}: {cert_err}")
+                    logger.error(f"[ACME-RENEWAL] Failed to initiate renewal for cert {cert['id']}: {cert_err}")
 
-            # --- Phase 2: Poll and complete in-progress orders ---
-            conn_poll = await get_database_connection()
-            try:
-                in_progress = await conn_poll.fetch("""
-                    SELECT id, status FROM letsencrypt_orders
-                    WHERE (
-                        status IN ('pending', 'processing', 'ready')
-                        OR (status = 'valid' AND ssl_certificate_id IS NULL)
-                    )
-                    AND created_at > NOW() - INTERVAL '7 days'
-                    ORDER BY created_at
-                """)
-            finally:
-                await close_database_connection(conn_poll)
-
-            for order_row in in_progress:
-                oid = order_row['id']
-                try:
-                    status_info = await acme_svc.check_order_status(oid)
-                    current_status = status_info.get('status', order_row['status'])
-
-                    if current_status == 'ready':
-                        await acme_svc.finalize_order(oid)
-                        status_info = await acme_svc.check_order_status(oid)
-                        current_status = status_info.get('status')
-
-                    if current_status == 'valid' and status_info.get('certificate_url'):
-                        result = await _complete_certificate(oid)
-                        logger.info(f"ACME RENEWAL: Completed order {oid} - {result.get('message', '')}")
-                    elif current_status == 'invalid':
-                        logger.warning(f"ACME RENEWAL: Order {oid} is invalid, skipping")
-                    elif current_status in ('pending', 'processing'):
-                        logger.info(f"ACME RENEWAL: Order {oid} still {current_status}, will retry next cycle")
-                except Exception as poll_err:
-                    logger.error(f"ACME RENEWAL: Failed to poll/complete order {oid}: {poll_err}")
-
-            # --- Phase 3: Warn about stuck orders ---
+            # Phase 2: Warn about stuck orders (completion handled by complete_pending_acme_orders)
             conn3 = await get_database_connection()
             try:
                 stuck_orders = await conn3.fetch("""
@@ -397,10 +462,10 @@ async def check_letsencrypt_renewals():
                 await close_database_connection(conn3)
             if stuck_orders:
                 stuck_ids = [str(o['id']) for o in stuck_orders]
-                logger.warning(f"ACME RENEWAL WARNING: {len(stuck_orders)} order(s) stuck > 24h: IDs=[{', '.join(stuck_ids)}]")
+                logger.warning(f"[ACME-RENEWAL] {len(stuck_orders)} order(s) stuck > 24h: IDs=[{', '.join(stuck_ids)}]")
 
         except Exception as e:
-            logger.error(f"Error in ACME renewal check: {e}")
+            logger.error(f"[ACME-RENEWAL] Error in renewal check: {e}")
             if conn:
                 try:
                     await close_database_connection(conn)
@@ -604,6 +669,12 @@ async def startup_event():
         # Start ACME certificate auto-renewal task
         asyncio.create_task(check_letsencrypt_renewals())
         logger.info("ACME certificate auto-renewal task started (hourly checks)")
+
+        # Issue #12: Independent task for completing CA-validated orders.
+        # Runs every 60s with atomic claim (FOR UPDATE SKIP LOCKED) — multi-replica safe.
+        # Decoupled from auto_renew_enabled flag so user-initiated orders also complete.
+        asyncio.create_task(complete_pending_acme_orders())
+        logger.info("ACME order auto-completion task started (60s checks, replica-safe)")
         
         # Create test activity log entry to verify system is working
         try:

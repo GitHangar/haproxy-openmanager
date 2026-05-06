@@ -35,7 +35,9 @@ RESOURCE_MAPPING = {
     '/api/auth/logout': 'auth',
     '/api/configuration': 'configuration',
     '/api/security/agent-tokens': 'agent_token',
-    '/api/maintenance': 'maintenance'
+    '/api/maintenance': 'maintenance',
+    # Audit Tur 4/5 / Commit 8: ACME endpoint coverage
+    '/api/letsencrypt': 'letsencrypt_order',
 }
 
 # Special action mappings
@@ -46,7 +48,16 @@ SPECIAL_ACTIONS = {
     '/api/backends/{backend_id}/toggle': 'toggle_backend',
     '/api/agents/{agent_id}/toggle': 'toggle_agent',
     '/api/users/{user_id}/password': 'change_password',
-    '/api/users/{user_id}/roles': 'assign_roles'
+    '/api/users/{user_id}/roles': 'assign_roles',
+    # Audit Tur 5/6 / Commit 8: discrete ACME actions for compliance audit
+    '/api/letsencrypt/certificates': 'acme_certificate_requested',
+    '/api/letsencrypt/certificates/{cert_id}/revoke': 'acme_certificate_revoked',
+    '/api/letsencrypt/import-ca-chain': 'acme_ca_chain_imported',
+    '/api/letsencrypt/accounts': 'acme_account_created',
+    '/api/letsencrypt/accounts/{account_id}': 'acme_account_deactivated',
+    '/api/letsencrypt/accounts/{account_id}/permanent': 'acme_account_purged',
+    '/api/letsencrypt/orders/{order_id}/retry': 'acme_order_retried',
+    '/api/letsencrypt/orders/{order_id}': 'acme_order_cancelled',
 }
 
 def extract_resource_info(path: str, method: str) -> tuple[str, str, Optional[str]]:
@@ -89,7 +100,9 @@ def matches_pattern(path: str, pattern: str) -> bool:
 
 def extract_resource_type_from_path(path: str) -> str:
     """Extract resource type from path"""
-    if '/frontends' in path:
+    if '/letsencrypt' in path:
+        return 'letsencrypt_order'
+    elif '/frontends' in path:
         return 'frontend'
     elif '/backends' in path:
         return 'backend'

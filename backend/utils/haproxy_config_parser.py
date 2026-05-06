@@ -959,6 +959,14 @@ class HAProxyConfigParser:
             'status',          # Status page
         }
         
+        # Issue #11: Backend names that are auto-managed by HAProxy OpenManager.
+        # These must NEVER be persisted in DB; they're injected per-Apply by haproxy_config.py.
+        # If user-provided config contains them (e.g. via bulk import or restore),
+        # parser will warn-and-skip to prevent duplicate sections on subsequent Apply.
+        reserved_backend_names = reserved_names | {
+            '_acme_challenge_backend',  # Auto-injected ACME HTTP-01 challenge backend
+        }
+        
         # Check for duplicate frontend names - remove duplicates keeping first occurrence
         # Also check for reserved names that conflict with listen sections
         frontend_names_seen = set()
@@ -987,11 +995,12 @@ class HAProxyConfigParser:
         backend_names_seen = set()
         valid_backends = []
         for backend in self.backends:
-            # Check for reserved names first
-            if backend.name.lower() in reserved_names:
+            # Check for reserved names first (Issue #11: includes auto-managed backends)
+            if backend.name.lower() in reserved_backend_names:
                 self.warnings.append(
-                    f"⚠️ SKIPPED: Backend '{backend.name}' uses a reserved name that conflicts with "
-                    f"common HAProxy listen sections. Rename this backend to avoid conflicts."
+                    f"⚠️ SKIPPED: Backend '{backend.name}' uses a reserved/auto-managed name. "
+                    f"This backend is managed automatically by HAProxy OpenManager and should not "
+                    f"be defined manually."
                 )
                 continue
             

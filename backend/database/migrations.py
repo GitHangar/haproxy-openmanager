@@ -1601,6 +1601,8 @@ async def run_all_migrations():
     await ensure_system_settings_table()
     await ensure_acme_tables()
     await ensure_acme_columns_on_existing_tables()
+    # Issue #11 cleanup: must run AFTER acme_tables/columns to ensure FK refs exist
+    await cleanup_orphan_acme_challenge_backend()
     
     logger.info("Database migrations completed successfully.")
 
@@ -3175,12 +3177,17 @@ async def ensure_acme_columns_on_existing_tables():
             ('auto_renew', "ALTER TABLE ssl_certificates ADD COLUMN IF NOT EXISTS auto_renew BOOLEAN DEFAULT FALSE"),
             ('acme_enabled', "ALTER TABLE haproxy_clusters ADD COLUMN IF NOT EXISTS acme_enabled BOOLEAN DEFAULT FALSE"),
             ('acme_backend_url', "ALTER TABLE haproxy_clusters ADD COLUMN IF NOT EXISTS acme_backend_url VARCHAR(500)"),
+            # Issue #12 / Commit 5a: track challenge response attempts for rate-limit + retry policy
+            ('attempts', "ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0"),
+            ('last_attempt_at', "ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ"),
+            # Commit 3a: track auto-completion task lock/poll timestamps for atomic claim across replicas
+            ('orders_updated_at_idx', "CREATE INDEX IF NOT EXISTS idx_letsencrypt_orders_status_updated ON letsencrypt_orders(status, updated_at) WHERE status = 'valid' AND ssl_certificate_id IS NULL"),
         ]:
             try:
                 await conn.execute(sql)
-                logger.info(f"Ensured column exists: {col}")
+                logger.info(f"Ensured column/index exists: {col}")
             except Exception as col_err:
-                logger.warning(f"Column {col} migration note: {col_err}")
+                logger.warning(f"Column/index {col} migration note: {col_err}")
 
         await close_database_connection(conn)
 
@@ -3188,3 +3195,50 @@ async def ensure_acme_columns_on_existing_tables():
         if conn:
             await close_database_connection(conn)
         logger.error(f"Error adding ACME columns: {e}")
+
+
+async def cleanup_orphan_acme_challenge_backend():
+    """
+    Issue #11: One-time cleanup of orphan `_acme_challenge_backend` rows that may
+    have been persisted by previous versions where agent sync did not filter
+    auto-managed backends. Idempotent (NO-OP if zero rows).
+    
+    backend_servers.backend_id has ON DELETE CASCADE, so deleting parent backends
+    will cascade-delete dependent server rows. We also explicitly delete by
+    backend_name first to clean up any orphan rows where backend_id may be NULL
+    or stale (string-based references).
+    """
+    conn = None
+    try:
+        conn = await get_database_connection()
+        
+        cnt = await conn.fetchval(
+            "SELECT COUNT(*) FROM backends WHERE name = '_acme_challenge_backend'"
+        )
+        if cnt and cnt > 0:
+            logger.warning(
+                f"CLEANUP MIGRATION: Found {cnt} orphan '_acme_challenge_backend' "
+                f"row(s). Removing (Issue #11 cleanup)."
+            )
+            async with conn.transaction():
+                # Defensive: clean up any backend_servers rows by name first
+                # (catches orphans where backend_id is NULL or stale)
+                bs_cnt = await conn.execute(
+                    "DELETE FROM backend_servers WHERE backend_name = '_acme_challenge_backend'"
+                )
+                logger.info(f"CLEANUP MIGRATION: Removed backend_servers rows: {bs_cnt}")
+                
+                # Delete parent backends - FK CASCADE removes any remaining backend_servers
+                be_cnt = await conn.execute(
+                    "DELETE FROM backends WHERE name = '_acme_challenge_backend'"
+                )
+                logger.info(f"CLEANUP MIGRATION: Removed backends rows: {be_cnt}")
+        else:
+            logger.info("CLEANUP MIGRATION: No orphan '_acme_challenge_backend' rows found (clean state)")
+        
+        await close_database_connection(conn)
+
+    except Exception as e:
+        if conn:
+            await close_database_connection(conn)
+        logger.error(f"Error in cleanup_orphan_acme_challenge_backend: {e}")

@@ -207,3 +207,70 @@ class MockDatabase:
 def mock_database():
     """Mock database fixture"""
     return MockDatabase()
+
+
+# ====================================================================
+# ACME-specific fixtures (Issues #10, #11, #12 — v1.4.0)
+# ====================================================================
+
+@pytest.fixture
+def sample_letsencrypt_account_data():
+    """Sample Let's Encrypt account row."""
+    return {
+        "id": 1,
+        "email": "ops@example.com",
+        "directory_url": "https://acme-staging-v02.api.letsencrypt.org/directory",
+        "account_url": "https://acme-staging-v02.api.letsencrypt.org/acme/acct/12345",
+        "jwk_private_key": "-----BEGIN PRIVATE KEY-----\nMIG...\n-----END PRIVATE KEY-----\n",
+        "status": "valid",
+        "tos_agreed": True,
+        "eab_kid": None,
+        "eab_hmac_key": None,
+    }
+
+
+@pytest.fixture
+def sample_acme_order_data():
+    """Sample ACME order row (matches letsencrypt_orders schema)."""
+    return {
+        "id": 100,
+        "account_id": 1,
+        "order_url": "https://acme-staging-v02.api.letsencrypt.org/acme/order/12345/678",
+        "status": "pending",
+        "domains": json.dumps(["example.com", "www.example.com"]),
+        "finalize_url": "https://acme-staging-v02.api.letsencrypt.org/acme/finalize/12345/678",
+        "certificate_url": None,
+        "cert_private_key": None,
+        "expires_at": None,
+        "cluster_ids": json.dumps([1]),
+        "ssl_certificate_id": None,
+        "error_detail": None,
+    }
+
+
+@pytest.fixture
+def sample_acme_challenge_data():
+    """Sample ACME http-01 challenge row."""
+    return {
+        "id": 1000,
+        "order_id": 100,
+        "domain": "example.com",
+        "token": "abc123-token-placeholder",
+        "key_authorization": "abc123-token-placeholder.thumbprint-here",
+        "challenge_url": "https://acme-staging-v02.api.letsencrypt.org/acme/chall/12345/678/http-01",
+        "status": "pending",
+        "attempts": 0,
+        "last_attempt_at": None,
+    }
+
+
+@pytest.fixture
+def sample_acme_cluster_data():
+    """Sample ACME-enabled cluster row."""
+    return {
+        "id": 1,
+        "name": "test-cluster",
+        "is_active": True,
+        "acme_enabled": True,
+        "acme_backend_url": None,
+    }

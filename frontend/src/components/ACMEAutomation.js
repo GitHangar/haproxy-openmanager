@@ -20,6 +20,46 @@ const { Option } = Select;
 const getErrorMsg = (err, fallback) =>
   err?.response?.data?.error?.message || err?.response?.data?.detail || fallback;
 
+// Render letsencrypt_orders.error_detail (TEXT column). Backend now writes
+// structured JSON-strings (stage / http_status / ca_response / timestamp) for
+// CA-side failures, but legacy rows may still contain plain strings.
+// Attempt JSON parse first; otherwise fall back to literal text.
+const renderErrorDetail = (raw) => {
+  if (!raw) return null;
+  let parsed = null;
+  if (typeof raw === 'string' && raw.trim().startsWith('{')) {
+    try { parsed = JSON.parse(raw); } catch (_e) { parsed = null; }
+  } else if (typeof raw === 'object') {
+    parsed = raw;
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return <span style={{ whiteSpace: 'pre-wrap' }}>{String(raw)}</span>;
+  }
+  const stage = parsed.stage || parsed.step || 'error';
+  const httpStatus = parsed.http_status;
+  const reason = parsed.reason;
+  const caRespRaw = parsed.ca_response;
+  const caRespText = caRespRaw == null
+    ? null
+    : (typeof caRespRaw === 'string' ? caRespRaw : JSON.stringify(caRespRaw, null, 2));
+  const ts = parsed.timestamp;
+  return (
+    <div style={{ fontSize: 13 }}>
+      <div><strong>Stage:</strong> {stage}{httpStatus ? ` (HTTP ${httpStatus})` : ''}</div>
+      {reason && <div><strong>Reason:</strong> {reason}</div>}
+      {ts && <div><strong>At:</strong> {ts}</div>}
+      {caRespText && (
+        <details style={{ marginTop: 6 }}>
+          <summary style={{ cursor: 'pointer' }}>CA response</summary>
+          <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', marginTop: 6 }}>
+            {caRespText}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+};
+
 const ACMEAutomation = () => {
   const navigate = useNavigate();
   const { clusters: allClusters, selectCluster } = useCluster();
@@ -66,6 +106,19 @@ const ACMEAutomation = () => {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
+  // Commit 8b (Audit Tur 3): conditional UI polling — auto-refresh every 30s
+  // when there are any in-progress or stuck orders, so the user sees Auto-Completion
+  // task results without manually clicking Refresh. Pauses when nothing is pending.
+  const hasInProgress = orders.some(o =>
+    o.status === 'pending' || o.status === 'processing' || o.status === 'ready' ||
+    (o.status === 'valid' && !o.ssl_certificate_id)
+  );
+  useEffect(() => {
+    if (!hasInProgress) return undefined;
+    const interval = setInterval(() => { fetchData(); }, 30000);
+    return () => clearInterval(interval);
+  }, [hasInProgress, fetchData]);
+
   const acmeCerts = renewalSchedule.length;
   const calcDaysLeft = (expiryDate) => {
     if (!expiryDate) return null;
@@ -73,7 +126,12 @@ const ACMEAutomation = () => {
   };
   const nextRenewal = renewalSchedule.find(c => c.auto_renew && calcDaysLeft(c.expiry_date) > 0);
   const nextRenewalDays = nextRenewal ? calcDaysLeft(nextRenewal.expiry_date) : null;
-  const pendingOrders = orders.filter(o => o.status === 'pending' || o.status === 'processing');
+  // Issue #11/#12: an order is "in progress" if it's pre-valid OR valid-but-not-downloaded (stuck).
+  // Including 'ready' here ensures the dashboard counter & UI auto-refresh react to all in-flight states.
+  const isOrderStuck = (o) => o.status === 'valid' && !o.ssl_certificate_id;
+  const pendingOrders = orders.filter(o =>
+    o.status === 'pending' || o.status === 'processing' || o.status === 'ready' || isOrderStuck(o)
+  );
   const activeAccount = accounts.find(a => a.status === 'valid') || null;
   const acmeAccount = activeAccount || (accounts.length > 0 ? accounts[accounts.length - 1] : null);
   const acmeEnabledClusters = clusters.filter(c => c.acme_enabled && c.is_active);
@@ -117,7 +175,15 @@ const ACMEAutomation = () => {
   const handleRetry = async (orderId) => {
     try {
       const res = await axios.post(`/api/letsencrypt/orders/${orderId}/retry`);
-      message.success(res.data?.message || 'Retry submitted');
+      // Backend may signal that the auto-completion task is already processing
+      // this order — show as info (not success) so the user understands no
+      // duplicate work is needed. UI auto-refresh will pick up the result.
+      const msg = res.data?.message || 'Retry submitted';
+      if (res.data?.in_progress) {
+        message.info(msg, 6);
+      } else {
+        message.success(msg);
+      }
       fetchData();
     } catch (err) {
       message.error(getErrorMsg(err, 'Retry failed'));
@@ -238,7 +304,13 @@ const ACMEAutomation = () => {
     });
   };
 
-  const statusTag = (status) => {
+  const statusTag = (status, record) => {
+    // Issue #12 / Commit 4a: highlight "valid but not downloaded" stuck orders prominently.
+    if (record && record.status === 'valid' && !record.ssl_certificate_id) {
+      return (
+        <Tag color="warning" icon={<ExclamationCircleOutlined />}>PENDING DOWNLOAD</Tag>
+      );
+    }
     const map = {
       pending: { color: 'processing', icon: <ClockCircleOutlined /> },
       processing: { color: 'processing', icon: <SyncOutlined spin /> },
@@ -261,7 +333,7 @@ const ACMEAutomation = () => {
     },
     {
       title: 'Status', dataIndex: 'status', key: 'status',
-      render: statusTag,
+      render: (status, record) => statusTag(status, record),
     },
     {
       title: 'Account', dataIndex: 'account_email', key: 'account_email',
@@ -273,23 +345,37 @@ const ACMEAutomation = () => {
     },
     {
       title: 'Actions', key: 'actions',
-      render: (_, record) => (
-        <Space>
-          <Tooltip title="View Details">
-            <Button icon={<EyeOutlined />} size="small" onClick={() => handleViewOrder(record.id)} />
-          </Tooltip>
-          {(record.status === 'pending' || record.status === 'processing' || record.status === 'ready') && (
-            <Tooltip title="Retry / Finalize">
-              <Button icon={<ReloadOutlined />} size="small" type="primary" ghost onClick={() => handleRetry(record.id)} />
+      render: (_, record) => {
+        const stuck = isOrderStuck(record);
+        const showRetry = record.status === 'pending' || record.status === 'processing' || record.status === 'ready';
+        const showComplete = stuck;
+        // Cancel: any non-final state (incl. stuck), but not for fully-completed valid orders.
+        const showCancel = (record.status !== 'valid' && record.status !== 'cancelled') || stuck;
+        return (
+          <Space>
+            <Tooltip title="View Details">
+              <Button icon={<EyeOutlined />} size="small" onClick={() => handleViewOrder(record.id)} />
             </Tooltip>
-          )}
-          {record.status !== 'valid' && record.status !== 'cancelled' && (
-            <Tooltip title="Cancel">
-              <Button icon={<DeleteOutlined />} size="small" danger onClick={() => handleCancel(record.id)} />
-            </Tooltip>
-          )}
-        </Space>
-      ),
+            {showRetry && (
+              <Tooltip title="Retry / Finalize">
+                <Button icon={<ReloadOutlined />} size="small" type="primary" ghost onClick={() => handleRetry(record.id)} />
+              </Tooltip>
+            )}
+            {showComplete && (
+              <Tooltip title="Complete (download certificate)">
+                <Button icon={<CheckCircleOutlined />} size="small" type="primary" onClick={() => handleRetry(record.id)}>
+                  Complete
+                </Button>
+              </Tooltip>
+            )}
+            {showCancel && (
+              <Tooltip title={stuck ? "Cancel stuck order" : "Cancel"}>
+                <Button icon={<DeleteOutlined />} size="small" danger onClick={() => handleCancel(record.id)} />
+              </Tooltip>
+            )}
+          </Space>
+        );
+      },
     },
   ];
 
@@ -484,15 +570,25 @@ const ACMEAutomation = () => {
         </Card>
       )}
 
-      {pendingOrders.length > 0 && (
-        <Alert
-          type="warning"
-          showIcon
-          icon={<ExclamationCircleOutlined />}
-          message={`${pendingOrders.length} certificate order(s) awaiting validation or Apply`}
-          style={{ marginBottom: 16 }}
-        />
-      )}
+      {pendingOrders.length > 0 && (() => {
+        const stuckCount = pendingOrders.filter(isOrderStuck).length;
+        const inFlightCount = pendingOrders.length - stuckCount;
+        const parts = [];
+        if (inFlightCount > 0) parts.push(`${inFlightCount} awaiting validation`);
+        if (stuckCount > 0) parts.push(`${stuckCount} pending download (auto-retrying every 60s)`);
+        return (
+          <Alert
+            type="warning"
+            showIcon
+            icon={<ExclamationCircleOutlined />}
+            message={`${pendingOrders.length} certificate order(s) in progress: ${parts.join(', ')}`}
+            description={stuckCount > 0
+              ? "Stuck orders will auto-complete via the background task. You can also click \"Complete\" to retry immediately."
+              : undefined}
+            style={{ marginBottom: 16 }}
+          />
+        );
+      })()}
 
       <Row gutter={[16, 16]} style={{ marginBottom: 24 }}>
         <Col xs={12} sm={12} md={6}>
@@ -651,11 +747,33 @@ const ACMEAutomation = () => {
       >
         {orderDetail && (
           <>
-            <p><strong>Status:</strong> {statusTag(orderDetail.status)}</p>
+            <p><strong>Status:</strong> {statusTag(orderDetail.status, orderDetail)}</p>
             <p><strong>Domains:</strong> {(orderDetail.domains || []).map(d => <Tag key={d}>{d}</Tag>)}</p>
             <p><strong>Account:</strong> {orderDetail.account_email}</p>
+            {/* Issue #12 / Commit 4b: explicit completion state for the order */}
+            <p>
+              <strong>Certificate:</strong>{' '}
+              {orderDetail.ssl_certificate_id ? (
+                <Tag color="success" icon={<CheckCircleOutlined />}>
+                  Completed (Cert #{orderDetail.ssl_certificate_id})
+                </Tag>
+              ) : orderDetail.status === 'valid' ? (
+                <Tag color="warning" icon={<ExclamationCircleOutlined />}>
+                  Pending download — auto-completion task will retry every 60s
+                </Tag>
+              ) : orderDetail.status === 'invalid' || orderDetail.status === 'cancelled' ? (
+                <Tag color="default">Not issued</Tag>
+              ) : (
+                <Tag color="processing" icon={<SyncOutlined spin />}>Awaiting CA validation</Tag>
+              )}
+            </p>
             {orderDetail.error_detail && (
-              <Alert type="error" message="Error" description={orderDetail.error_detail} style={{ marginBottom: 16 }} />
+              <Alert
+                type="error"
+                message="Error"
+                description={renderErrorDetail(orderDetail.error_detail)}
+                style={{ marginBottom: 16 }}
+              />
             )}
             {orderDetail.challenges?.length > 0 && (
               <>
@@ -668,7 +786,7 @@ const ACMEAutomation = () => {
                   columns={[
                     { title: 'Domain', dataIndex: 'domain', key: 'domain' },
                     { title: 'Token', dataIndex: 'token', key: 'token', ellipsis: true },
-                    { title: 'Status', dataIndex: 'status', key: 'status', render: statusTag },
+                    { title: 'Status', dataIndex: 'status', key: 'status', render: (s) => statusTag(s) },
                   ]}
                 />
               </>

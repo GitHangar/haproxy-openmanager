@@ -16,6 +16,16 @@ jobs:
         id: version
         run: echo "TAG=$(date +'%Y%m%d.%H%M')" >> $GITHUB_OUTPUT
 
+      - name: read product version
+        id: prodversion
+        run: |
+          VERSION=$(jq -r .version version.json)
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Failed to read product version from version.json" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
       - name: set up qemu
         uses: docker/setup-qemu-action@v3
 
@@ -38,6 +48,7 @@ jobs:
           tags: |
             taylanbakircioglu/haproxy-openmanager-backend:latest
             taylanbakircioglu/haproxy-openmanager-backend:${{ steps.version.outputs.TAG }}
+            taylanbakircioglu/haproxy-openmanager-backend:${{ steps.prodversion.outputs.VERSION }}
 
       - name: build & push frontend
         uses: docker/build-push-action@v6
@@ -49,4 +60,4 @@ jobs:
           tags: |
             taylanbakircioglu/haproxy-openmanager-frontend:latest
             taylanbakircioglu/haproxy-openmanager-frontend:${{ steps.version.outputs.TAG }}
-
+            taylanbakircioglu/haproxy-openmanager-frontend:${{ steps.prodversion.outputs.VERSION }}

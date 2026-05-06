@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException, Header
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 import json
 import logging
+import re
 import time
 from datetime import datetime
 
@@ -14,6 +15,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/letsencrypt", tags=["Let's Encrypt / ACME"])
 
+# RFC 1035 / RFC 5890: hostname/domain label rules. Permits wildcards (*).
+_DOMAIN_REGEX = re.compile(
+    r'^(?:\*\.)?(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+)
+
 
 class AccountCreate(BaseModel):
     email: str
@@ -24,10 +30,31 @@ class AccountCreate(BaseModel):
 
 
 class CertificateRequest(BaseModel):
-    domains: List[str]
+    # Audit Tur 5 / Commit 8c-2: harden input validation.
+    # min_length=1: reject empty domain list at API boundary.
+    # max_length=100: prevent abuse / oversized SAN bundles.
+    # Default cluster_ids to [] (not None) to simplify downstream handling.
+    domains: List[str] = Field(..., min_length=1, max_length=100)
     account_id: Optional[int] = None
-    cluster_ids: Optional[List[int]] = None
+    cluster_ids: List[int] = Field(default_factory=list)
     auto_renew: bool = True
+
+    @field_validator('domains')
+    @classmethod
+    def validate_domains(cls, v):
+        normalized = []
+        for d in v:
+            if not d or not isinstance(d, str):
+                raise ValueError("Domain entries must be non-empty strings")
+            d_norm = d.strip().lower()
+            if not d_norm or len(d_norm) > 253:
+                raise ValueError(f"Invalid domain length: '{d}' (max 253 chars)")
+            if '..' in d_norm or d_norm.startswith('.') or d_norm.endswith('.'):
+                raise ValueError(f"Invalid domain syntax: '{d}'")
+            if not _DOMAIN_REGEX.match(d_norm):
+                raise ValueError(f"Invalid domain format: '{d}'")
+            normalized.append(d_norm)
+        return normalized
 
 
 # --- Account management ---
@@ -57,8 +84,15 @@ async def create_account(body: AccountCreate, authorization: str = Header(None))
     try:
         settings = await acme_service._get_settings()
         directory_url = body.directory_url or settings.get('directory_url', 'https://acme-v02.api.letsencrypt.org/directory')
+        # Commit 5f: respect staging mode for non-Let's Encrypt CAs as well.
+        # If `acme.staging_url_override` is set in system_settings, use it when staging
+        # mode is active. Falls back to LE staging for the default LE production URL.
         if settings.get('staging_mode'):
-            if 'letsencrypt' in directory_url:
+            override = settings.get('staging_url_override') or ''
+            if override and override.startswith('http'):
+                logger.info(f"ACME: Using staging_url_override: {override}")
+                directory_url = override
+            elif 'letsencrypt' in directory_url:
                 directory_url = 'https://acme-staging-v02.api.letsencrypt.org/directory'
 
         eab_kid = body.eab_kid or settings.get('eab_kid', '') or None
@@ -153,6 +187,7 @@ async def request_certificate(body: CertificateRequest, authorization: str = Hea
     if not has_perm:
         raise HTTPException(status_code=403, detail="Insufficient permissions: ssl.create required")
 
+    # Pydantic enforces min_length=1 — this is a defensive double-check.
     if not body.domains:
         raise HTTPException(status_code=400, detail="At least one domain is required")
 
@@ -178,22 +213,48 @@ async def request_certificate(body: CertificateRequest, authorization: str = Hea
         logger.info(f"ACME: Using account_id={account_id} for certificate request")
 
         warnings = []
-        try:
-            conn_warn = await get_database_connection()
+        # Audit Tur 5 / Commit 8c: empty cluster_ids in UI means "global certificate".
+        # Resolve to all ACME-enabled active clusters; only fail if NONE exist.
+        if not body.cluster_ids:
+            conn_resolve = await get_database_connection()
             try:
-                acme_clusters = await conn_warn.fetchval(
-                    "SELECT COUNT(*) FROM haproxy_clusters WHERE acme_enabled = TRUE AND is_active = TRUE"
+                acme_clusters_resolved = await conn_resolve.fetch(
+                    "SELECT id FROM haproxy_clusters WHERE acme_enabled = TRUE AND is_active = TRUE"
                 )
-                if acme_clusters == 0:
-                    logger.warning("ACME: No clusters with ACME Challenge Routing enabled - certificate validation will likely fail")
-                    warnings.append(
-                        "No clusters have ACME Challenge Routing enabled. "
-                        "Certificate validation will fail. Enable it in Cluster Management and Apply Changes first."
-                    )
             finally:
-                await close_database_connection(conn_warn)
-        except Exception:
-            pass
+                await close_database_connection(conn_resolve)
+            if not acme_clusters_resolved:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Cannot issue certificate: no ACME-enabled clusters configured. "
+                           "Enable ACME Challenge Routing on at least one cluster in Cluster Management, "
+                           "Apply the configuration change, then retry."
+                )
+            body.cluster_ids = [c['id'] for c in acme_clusters_resolved]
+            warnings.append(
+                f"No clusters specified — applied to all ACME-enabled cluster(s) ({len(body.cluster_ids)})"
+            )
+            logger.warning(
+                f"ACME: Empty cluster_ids → global cert fallback to {len(body.cluster_ids)} ACME-enabled cluster(s)"
+            )
+        else:
+            # Validate that referenced clusters exist + are ACME-enabled (warn-only).
+            try:
+                conn_warn = await get_database_connection()
+                try:
+                    acme_clusters = await conn_warn.fetchval(
+                        "SELECT COUNT(*) FROM haproxy_clusters WHERE acme_enabled = TRUE AND is_active = TRUE"
+                    )
+                    if acme_clusters == 0:
+                        logger.warning("ACME: No clusters with ACME Challenge Routing enabled - certificate validation will likely fail")
+                        warnings.append(
+                            "No clusters have ACME Challenge Routing enabled. "
+                            "Certificate validation will fail. Enable it in Cluster Management and Apply Changes first."
+                        )
+                finally:
+                    await close_database_connection(conn_warn)
+            except Exception:
+                pass
 
         order = await acme_service.create_order(
             account_id=account_id,
@@ -203,11 +264,25 @@ async def request_certificate(body: CertificateRequest, authorization: str = Hea
 
         challenges = await acme_service.respond_to_challenges(order['order_id'])
 
-        logger.info(f"ACME: Order {order['order_id']} created, {len(challenges)} challenge(s) posted, status={order['status']}")
+        # Commit 5b: re-fetch the order's *current* status from DB. The status
+        # returned by create_order() reflects the moment of creation; after
+        # respond_to_challenges() the CA may have already advanced it (e.g. to
+        # 'processing'). Surfacing stale status leads UI to under-poll.
+        conn_status = await get_database_connection()
+        try:
+            fresh_status = await conn_status.fetchval(
+                "SELECT status FROM letsencrypt_orders WHERE id = $1",
+                order['order_id']
+            )
+        finally:
+            await close_database_connection(conn_status)
+        effective_status = fresh_status or order['status']
+
+        logger.info(f"ACME: Order {order['order_id']} created, {len(challenges)} challenge(s) posted, status={effective_status}")
 
         return {
             "order_id": order['order_id'],
-            "status": order['status'],
+            "status": effective_status,
             "domains": body.domains,
             "challenges": challenges,
             "message": "Order created. ACME challenges have been posted. Waiting for CA validation.",
@@ -289,6 +364,40 @@ async def retry_order(order_id: int, authorization: str = Header(None)):
     if not has_perm:
         raise HTTPException(status_code=403, detail="Insufficient permissions: ssl.create required")
     try:
+        # Idempotency + concurrency guard. Two checks in one round-trip:
+        #   1. ssl_certificate_id NOT NULL   -> already done, return success
+        #   2. updated_at touched in last 30s -> auto-completion task is actively
+        #      processing this order. Returning a 202-style hint avoids a
+        #      simultaneous duplicate _complete_certificate() race that would
+        #      hit the ssl_certificates UNIQUE(name) constraint and cost an
+        #      extra CA download.
+        conn = await get_database_connection()
+        try:
+            row = await conn.fetchrow(
+                """SELECT ssl_certificate_id,
+                          (updated_at IS NOT NULL AND updated_at > NOW() - INTERVAL '30 seconds')
+                              AS recently_touched
+                   FROM letsencrypt_orders WHERE id = $1""",
+                order_id
+            )
+        finally:
+            await close_database_connection(conn)
+        if not row:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if row['ssl_certificate_id']:
+            return {
+                "message": "Certificate already issued for this order",
+                "order_id": order_id,
+                "certificate_id": row['ssl_certificate_id'],
+            }
+        if row['recently_touched']:
+            return {
+                "message": "Order is currently being processed by the auto-completion task. "
+                           "Please wait ~60 seconds and refresh.",
+                "order_id": order_id,
+                "in_progress": True,
+            }
+
         status_info = await acme_service.check_order_status(order_id)
         current_status = status_info.get('status')
 
@@ -308,9 +417,32 @@ async def retry_order(order_id: int, authorization: str = Header(None)):
             result = await acme_service.finalize_order(order_id)
             safe_result = {k: v for k, v in result.items() if k not in ('private_key_pem', 'cert_private_key')}
             return {"message": "Order finalized", **safe_result}
-        elif current_status == 'valid' and status_info.get('certificate_url'):
-            return await _complete_certificate(order_id)
+        elif current_status == 'valid':
+            # Issue #12 / Commit 3b: handle valid-without-certificate-url edge case.
+            # CA marked the order valid but our DB has no certificate_url yet
+            # (race between finalize and check_order_status). Trigger finalize
+            # if not yet done, then drive completion.
+            if not status_info.get('certificate_url'):
+                logger.info(f"ACME RETRY: Order {order_id} valid without certificate_url, attempting finalize")
+                try:
+                    await acme_service.finalize_order(order_id)
+                except Exception as fin_err:
+                    # Order may already be finalized server-side; re-poll status
+                    logger.warning(f"ACME RETRY: finalize_order returned {fin_err}, re-polling status")
+                status_info = await acme_service.check_order_status(order_id)
+                current_status = status_info.get('status')
+            
+            if current_status == 'valid' and status_info.get('certificate_url'):
+                return await _complete_certificate(order_id)
+            else:
+                return {
+                    "message": f"Order is valid but certificate URL not yet available (status={current_status}). "
+                               f"Auto-completion task will retry within 60 seconds.",
+                    "order_id": order_id,
+                    "status": current_status,
+                }
         else:
+            # pending / processing — re-submit challenges
             challenges = await acme_service.respond_to_challenges(order_id)
             return {"message": "Challenges re-submitted", "status": current_status, "challenges": challenges}
     except HTTPException:
@@ -492,6 +624,16 @@ async def _complete_certificate(order_id: int) -> dict:
     4. For new certs: remain PENDING for manual Apply
     """
     conn = await get_database_connection()
+    # Concurrency guard: PostgreSQL session-level advisory lock keyed on order_id.
+    # Serializes concurrent _complete_certificate(order_id) calls across this
+    # process and across replicas (user-clicks-Complete + auto-completion task,
+    # or two simultaneous user clicks). A second caller blocks here until the
+    # first finishes, then re-reads ssl_certificate_id below and exits via the
+    # idempotency guard. Released in the outer finally before connection close.
+    # Namespace 0x41434D45 ('ACME' ASCII) XOR'd with order_id to avoid collision.
+    ADVISORY_NS = 0x41434D45
+    await conn.execute("SELECT pg_advisory_lock($1, $2)", ADVISORY_NS, order_id)
+    lock_held = True
     try:
         order = await conn.fetchrow("SELECT * FROM letsencrypt_orders WHERE id = $1", order_id)
         if not order:
@@ -512,7 +654,31 @@ async def _complete_certificate(order_id: int) -> dict:
         cluster_ids = json.loads(order['cluster_ids']) if isinstance(order['cluster_ids'], str) else order['cluster_ids']
         primary_domain = domains[0] if domains else 'unknown'
 
+        # Commit 5g: guard against empty cert_private_key.
+        # Inserting an SSL certificate row with an empty private_key would silently
+        # produce an unusable certificate (HAProxy would fail to load on Apply, or
+        # SSL handshakes would fail at runtime). Fail-fast with a clear diagnostic
+        # so the user can re-finalize the order.
         private_key_pem = order.get('cert_private_key') or ''
+        if not private_key_pem.strip() or '-----BEGIN' not in private_key_pem:
+            error_payload = json.dumps({
+                "stage": "_complete_certificate",
+                "reason": "missing_or_invalid_cert_private_key",
+                "private_key_present": bool(private_key_pem),
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            try:
+                await conn.execute(
+                    "UPDATE letsencrypt_orders SET status = 'invalid', error_detail = $1, updated_at = NOW() WHERE id = $2",
+                    error_payload, order_id
+                )
+            except Exception:
+                pass
+            raise Exception(
+                f"Cannot complete order {order_id}: cert_private_key is missing or invalid. "
+                f"This indicates finalize_order() did not persist the key correctly. "
+                f"Cancel this order and create a new certificate request."
+            )
 
         expiry_date = None
         days_until_expiry = 0
@@ -524,6 +690,13 @@ async def _complete_certificate(order_id: int) -> dict:
             cert_info = parse_ssl_certificate(cert_data['certificate_pem'])
             if cert_info and not cert_info.get('error'):
                 expiry_date = cert_info.get('expiry_date')
+                # Issue #10: ssl_certificates.expiry_date column is TIMESTAMP (timezone-naive).
+                # parse_ssl_certificate always returns timezone-aware UTC datetime.
+                # Without normalization asyncpg silently fails the INSERT/UPDATE for tz-aware
+                # values, leaving expiry_date NULL and breaking auto-renewal.
+                if expiry_date is not None and getattr(expiry_date, 'tzinfo', None) is not None:
+                    from datetime import timezone
+                    expiry_date = expiry_date.astimezone(timezone.utc).replace(tzinfo=None)
                 days_until_expiry = cert_info.get('days_until_expiry', 0)
                 issuer = cert_info.get('issuer')
                 fingerprint = cert_info.get('fingerprint')
@@ -574,7 +747,31 @@ async def _complete_certificate(order_id: int) -> dict:
             cert_id, order_id
         )
 
+        # Issue #12 / Commit 3c: idempotent ssl_certificate_clusters reconcile.
+        # On renewal, the order may carry a different cluster_ids list than the
+        # original cert's junction (user added new clusters between issue and renewal).
+        # We INSERT new entries (additive, ON CONFLICT DO NOTHING) but never DELETE
+        # existing junction rows — manually-added cluster assignments are preserved.
         if cluster_ids:
+            existing_cluster_set = set()
+            if is_renewal:
+                existing_rows = await conn.fetch(
+                    "SELECT cluster_id FROM ssl_certificate_clusters WHERE ssl_certificate_id = $1",
+                    cert_id
+                )
+                existing_cluster_set = {r['cluster_id'] for r in existing_rows}
+                new_clusters = [cid for cid in cluster_ids if cid not in existing_cluster_set]
+                if new_clusters:
+                    logger.info(
+                        f"ACME RENEWAL: Adding {len(new_clusters)} new cluster(s) to cert {cert_id}: {new_clusters}"
+                    )
+                # WARN if order mentioned clusters that were manually removed from junction
+                missing_in_order = existing_cluster_set - set(cluster_ids)
+                if missing_in_order:
+                    logger.warning(
+                        f"ACME RENEWAL: cert {cert_id} has manual junction entries not in order.cluster_ids: "
+                        f"{sorted(missing_in_order)}. Preserving manual assignments."
+                    )
             for cid in cluster_ids:
                 await conn.execute("""
                     INSERT INTO ssl_certificate_clusters (ssl_certificate_id, cluster_id)
@@ -589,14 +786,21 @@ async def _complete_certificate(order_id: int) -> dict:
             if mapped:
                 effective_cluster_ids = [r['cluster_id'] for r in mapped]
             else:
+                # Audit Tur 6 / Commit 5j: only fall back to ACME-enabled clusters.
+                # Applying renewal to ACME-disabled clusters could re-introduce Issue #11
+                # patterns and risks deploying certs to clusters where they can't be renewed.
                 all_clusters = await conn.fetch(
-                    "SELECT id FROM haproxy_clusters WHERE is_active = TRUE"
+                    "SELECT id FROM haproxy_clusters WHERE is_active = TRUE AND acme_enabled = TRUE"
                 )
                 effective_cluster_ids = [r['id'] for r in all_clusters]
             if effective_cluster_ids:
                 logger.info(f"ACME RENEWAL: Resolved {len(effective_cluster_ids)} cluster(s) for global cert {cert_id}")
 
         admin_uid = await conn.fetchval("SELECT id FROM users WHERE username = 'admin' LIMIT 1") or 1
+
+        # Issue #12 / Commit 4d: per-cluster error tracking + observability.
+        cluster_errors = []  # [{cluster_id, error}]
+        clusters_succeeded = []
 
         for cid in effective_cluster_ids:
             try:
@@ -608,20 +812,36 @@ async def _complete_certificate(order_id: int) -> dict:
                     INSERT INTO config_versions (cluster_id, version_name, config_content, status, created_by)
                     VALUES ($1, $2, $3, 'PENDING', $4)
                 """, cid, version_name, config_content, admin_uid)
+                clusters_succeeded.append(cid)
             except Exception as ve:
-                logger.error(f"Failed to create config version for cluster {cid}: {ve}")
+                # Was logger.error swallowing details; now surface to API caller.
+                logger.error(
+                    f"[ACME] Failed to create config version for cluster {cid} "
+                    f"(cert {cert_id}, action {action}): {ve}",
+                    exc_info=True
+                )
+                cluster_errors.append({"cluster_id": cid, "error": str(ve)})
 
-        if is_renewal:
-            await _auto_apply_renewal(cert_id, effective_cluster_ids)
+        if is_renewal and clusters_succeeded:
+            await _auto_apply_renewal(cert_id, clusters_succeeded)
 
         msg = "Certificate renewed and applied" if is_renewal else "Certificate issued (pending Apply)"
+        if cluster_errors:
+            msg += f" ({len(cluster_errors)} cluster(s) failed: see cluster_errors)"
         return {
             "message": msg,
             "certificate_id": cert_id,
             "domains": domains,
             "auto_applied": is_renewal,
+            "clusters_succeeded": clusters_succeeded,
+            "cluster_errors": cluster_errors,
         }
     finally:
+        if lock_held:
+            try:
+                await conn.execute("SELECT pg_advisory_unlock($1, $2)", ADVISORY_NS, order_id)
+            except Exception as unlock_err:
+                logger.warning(f"ACME: failed to release advisory lock for order {order_id}: {unlock_err}")
         await close_database_connection(conn)
 
 
@@ -859,7 +1079,31 @@ async def check_prerequisites(authorization: str = Header(None)):
             "pending_clusters": pending_clusters,
         })
 
-        # Step 5: DNS & Network (informational only)
+        # Step 5: Stuck order detection (Issue #12 / Commit 4c).
+        # An order in "valid" state but without ssl_certificate_id is stuck. The
+        # auto-completion task should resolve it within 60s, but surface visibility
+        # so users notice if Pebble/CA is unreachable.
+        stuck_orders = await conn.fetch("""
+            SELECT id, domains, created_at FROM letsencrypt_orders
+            WHERE status = 'valid' AND ssl_certificate_id IS NULL
+            AND created_at > NOW() - INTERVAL '7 days'
+            ORDER BY created_at DESC
+            LIMIT 10
+        """)
+        if stuck_orders:
+            stuck_ids = [r['id'] for r in stuck_orders]
+            steps.append({
+                "key": "stuck_orders",
+                "title": "Resolve Stuck Orders",
+                "ok": False,
+                "detail": f"{len(stuck_orders)} order(s) validated by CA but certificate not yet downloaded. "
+                          f"Auto-completion runs every 60s. Order IDs: {stuck_ids}. "
+                          f"If this persists, check ACME backend connectivity.",
+                "navigate": "/ssl-certificates?tab=acme",
+                "stuck_order_ids": stuck_ids,
+            })
+
+        # Step 6: DNS & Network (informational only)
         steps.append({
             "key": "network_dns",
             "title": "Verify DNS and Network",

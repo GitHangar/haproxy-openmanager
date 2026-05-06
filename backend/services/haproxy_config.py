@@ -832,37 +832,63 @@ async def generate_haproxy_config_for_cluster(cluster_id: int, conn: Optional[An
         
         # ACME challenge backend section
         if cluster_info.get('acme_enabled', False):
-            acme_url = cluster_info.get('acme_backend_url') or ''
-            if not acme_url:
-                try:
-                    acme_settings = await db_conn.fetchrow(
-                        "SELECT value FROM system_settings WHERE key = 'acme.challenge_backend_url'"
-                    )
-                    if acme_settings and acme_settings['value']:
-                        val = acme_settings['value']
-                        if isinstance(val, str):
-                            try:
-                                val = json.loads(val)
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-                        if val:
-                            acme_url = str(val)
-                except Exception:
-                    pass
-            if not acme_url:
-                from config import MANAGEMENT_BASE_URL
-                acme_url = MANAGEMENT_BASE_URL
+            # Issue #11: guard against duplicate `backend _acme_challenge_backend`.
+            # If the user-defined backends list already contains an entry with this
+            # reserved name (synced from agent or imported), skip auto-append to
+            # prevent HAProxy "Duplicate Name" validation failure on Apply.
+            already_rendered = any(
+                b.get('name') == '_acme_challenge_backend' for b in backends
+            )
+            # Commit 6a: skip auto-append if cluster has no HTTP-mode frontends.
+            # The acme-challenge backend is only useful when there's an HTTP frontend
+            # routing /.well-known/acme-challenge/* to it. On a TCP-only cluster the
+            # appended backend is dead config that pollutes the file (no use_backend
+            # ACL targets it), but it's harmless to HAProxy validation.
+            has_http_frontend = any(
+                (f.get('mode') or 'http').lower() == 'http' for f in frontends
+            )
+            if already_rendered:
+                logger.warning(
+                    "ACME auto-append skipped: '_acme_challenge_backend' already present "
+                    "in active backends list (likely synced from agent or restored)."
+                )
+            elif not has_http_frontend:
+                logger.info(
+                    f"ACME auto-append skipped for cluster {cluster_id}: no HTTP-mode "
+                    f"frontend found (would create orphan backend section)."
+                )
+            else:
+                acme_url = cluster_info.get('acme_backend_url') or ''
+                if not acme_url:
+                    try:
+                        acme_settings = await db_conn.fetchrow(
+                            "SELECT value FROM system_settings WHERE key = 'acme.challenge_backend_url'"
+                        )
+                        if acme_settings and acme_settings['value']:
+                            val = acme_settings['value']
+                            if isinstance(val, str):
+                                try:
+                                    val = json.loads(val)
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
+                            if val:
+                                acme_url = str(val)
+                    except Exception:
+                        pass
+                if not acme_url:
+                    from config import MANAGEMENT_BASE_URL
+                    acme_url = MANAGEMENT_BASE_URL
 
-            parsed = urllib.parse.urlparse(acme_url)
-            host = parsed.hostname or 'localhost'
-            port = parsed.port or (443 if parsed.scheme == 'https' else 8080)
-            ssl_flag = ' ssl verify none' if parsed.scheme == 'https' else ''
+                parsed = urllib.parse.urlparse(acme_url)
+                host = parsed.hostname or 'localhost'
+                port = parsed.port or (443 if parsed.scheme == 'https' else 8080)
+                ssl_flag = ' ssl verify none' if parsed.scheme == 'https' else ''
 
-            config_lines.append("# ACME Challenge Backend (auto-managed by HAProxy OpenManager)")
-            config_lines.append("backend _acme_challenge_backend")
-            config_lines.append("    mode http")
-            config_lines.append(f"    server _acme_mgmt {host}:{port}{ssl_flag}")
-            config_lines.append("")
+                config_lines.append("# ACME Challenge Backend (auto-managed by HAProxy OpenManager)")
+                config_lines.append("backend _acme_challenge_backend")
+                config_lines.append("    mode http")
+                config_lines.append(f"    server _acme_mgmt {host}:{port}{ssl_flag}")
+                config_lines.append("")
 
         # Only close the connection if it was created within this function
         if not conn:

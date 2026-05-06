@@ -245,6 +245,15 @@ const Settings = () => {
                 <Tag color="orange">Staging mode issues test certificates that are NOT trusted by browsers</Tag>
               </div>
 
+              {/* Commit 5f: optional staging URL override for non-LE CAs (Pebble, custom test ACME). */}
+              <Form.Item
+                name="staging_url_override"
+                label="Custom Staging Directory URL (optional)"
+                tooltip="When Staging Mode is on, use this URL instead of the default Let's Encrypt staging endpoint. Useful for testing with Pebble or a private ACME test CA."
+              >
+                <Input placeholder="https://pebble.example.local:14000/dir" allowClear />
+              </Form.Item>
+
               <Form.Item name="tos_accepted" label="Terms of Service Accepted" valuePropName="checked">
                 <Switch />
               </Form.Item>

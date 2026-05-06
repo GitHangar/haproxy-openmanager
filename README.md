@@ -237,13 +237,18 @@ This architecture provides better security (no inbound connections to HAProxy se
 
 #### ACME Auto SSL / Let's Encrypt
 - **Automated Certificate Issuance**: Request SSL certificates from Let's Encrypt or any ACME-compatible CA directly from the UI
-- **Automatic Renewal**: Background task monitors certificate expiry and renews automatically before expiration
+- **Automatic Renewal**: Hourly background task monitors certificate expiry and creates renewal orders before expiration
+- **Auto-Completion of Validated Orders** *(v1.4.0)*: Independent 60-second background task drives CA-validated orders through finalize -> download -> save without requiring user intervention; multi-replica safe via PostgreSQL `FOR UPDATE SKIP LOCKED` atomic claim, plus per-order session-level `pg_advisory_lock` to serialize concurrent completion attempts (UI "Complete" + auto-task race protection)
 - **Zero-Touch Deployment**: Renewed certificates are automatically applied through the same PENDING -> APPLIED pipeline as manual SSL updates, with agent notification
+- **Stuck Order Detection** *(v1.4.0)*: Setup wizard surfaces orders that the CA has validated but not yet downloaded, with one-click `Complete` action and automatic 60-second retry
 - **Multi-Provider Support**: Configurable ACME directory URL supports Let's Encrypt, ZeroSSL, Google Trust Services, Buypass, and custom CAs
-- **HTTP-01 Challenge**: Built-in challenge responder with automatic HAProxy routing injection
+- **HTTP-01 Challenge**: Built-in challenge responder with automatic HAProxy routing injection; reserved backend name `_acme_challenge_backend` is auto-managed and protected from manual edits / agent sync collisions
 - **ACME Account Management**: Register, view, and deactivate ACME accounts from the UI
 - **Staging Mode**: Test certificate issuance with Let's Encrypt staging environment before production
+- **Custom Staging Endpoint** *(v1.4.0)*: Optional `staging_url_override` setting lets you point staging mode at a private ACME test CA (e.g. Pebble) without touching the production directory URL
 - **External Account Binding (EAB)**: Support for CAs that require EAB (ZeroSSL, Google Trust Services)
+- **Structured Error Diagnostics** *(v1.4.0)*: All ACME failures (challenge, finalize, download) persist structured JSON to `letsencrypt_orders.error_detail` for clear post-mortem analysis
+- **Audit Logging** *(v1.4.0)*: Every ACME operation (request, revoke, CA-chain import, account ops) is captured in `user_activity_logs` for compliance review
 - **Backward Compatible**: ACME-managed and manually uploaded certificates coexist seamlessly; existing SSL workflows are completely unaffected
 
 #### Integration & API

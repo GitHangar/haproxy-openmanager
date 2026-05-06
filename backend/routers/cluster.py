@@ -3217,6 +3217,9 @@ async def confirm_restore_config_version(
             
             # Sync Frontends (ignore built-in frontends)
             IGNORED_FRONTENDS = ['stats']  # Built-in stats frontend
+            # Issue #11: System/auto-managed entities must not be persisted via restore
+            # (e.g. _acme_challenge_backend is auto-injected by haproxy_config.py).
+            IGNORED_BACKENDS = ['_acme_challenge_backend']
             for parsed_fe in parse_result.frontends:
                 if parsed_fe.name in IGNORED_FRONTENDS:
                     logger.info(f"RESTORE: Skipping built-in frontend '{parsed_fe.name}'")
@@ -3293,6 +3296,10 @@ async def confirm_restore_config_version(
             
             # Sync Backends
             for parsed_be in parse_result.backends:
+                # Issue #11: skip auto-managed system backends (e.g. _acme_challenge_backend).
+                if parsed_be.name in IGNORED_BACKENDS:
+                    logger.info(f"RESTORE: Skipping auto-managed backend '{parsed_be.name}'")
+                    continue
                 if parsed_be.name in current_be_dict:
                     # PHASE 5: Create snapshot BEFORE update (restore operation)
                     be_id = current_be_dict[parsed_be.name]

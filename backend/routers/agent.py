@@ -105,6 +105,31 @@ def _should_sync_frontend(frontend_name: str) -> bool:
         
     return True
 
+
+# ==== BACKEND SYNC HELPER ====
+def _should_sync_backend(backend_name: str) -> bool:
+    """
+    Determine if a backend should be synced from agent to management system.
+    Returns False for system/auto-managed backends that must not be persisted in DB.
+    
+    Issue #11: '_acme_challenge_backend' is auto-injected by haproxy_config.py
+    on every Apply when ACME is enabled. Persisting it in DB caused duplicate
+    sections on next Apply (HAProxy "Duplicate Name" validation failure).
+    """
+    # System/auto-managed backend names that must not be synced
+    skip_patterns = [
+        '_acme_challenge_backend',  # Issue #11: auto-managed ACME challenge backend
+    ]
+    
+    if backend_name in skip_patterns:
+        return False
+    
+    # Skip backends that start with underscore (system convention)
+    if backend_name.startswith('_'):
+        return False
+    
+    return True
+
 async def validate_user_cluster_access(user_id: int, cluster_id: int, conn):
     """Validate that user has access to the specified cluster"""
     # Check if cluster exists
@@ -1173,8 +1198,17 @@ async def agent_config_sync(agent_name: str, sync_data: dict, x_api_key: Optiona
             # Parse backend definitions
             if line.startswith('backend '):
                 backend_name = line.split(' ', 1)[1]
-                current_backend = backend_name
                 current_frontend = None
+                
+                # Issue #11: Skip system/auto-managed backends (e.g. _acme_challenge_backend).
+                # Setting current_backend = None ensures subsequent `server` lines under
+                # a skipped backend are NOT attached to a previous user backend (orphan rows).
+                if not _should_sync_backend(backend_name):
+                    logger.info(f"🚫 AGENT SYNC: Skipping system/auto-managed backend '{backend_name}' from sync")
+                    current_backend = None
+                    continue
+                
+                current_backend = backend_name
                 active_backends.append({
                     'name': backend_name,
                     'is_commented': False
@@ -1182,6 +1216,11 @@ async def agent_config_sync(agent_name: str, sync_data: dict, x_api_key: Optiona
                 continue
             elif line.startswith('# DISABLED: backend '):
                 backend_name = line[20:].strip()  # Remove "# DISABLED: backend "
+                
+                # Skip system/auto-managed backends even if disabled
+                if not _should_sync_backend(backend_name):
+                    continue
+                
                 active_backends.append({
                     'name': backend_name,
                     'is_commented': True
