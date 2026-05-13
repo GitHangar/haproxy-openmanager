@@ -433,7 +433,7 @@ async def test_check_agents_fail_when_none_registered():
 async def test_check_agents_warn_when_none_active():
     conn = AsyncMock()
     conn.fetch.return_value = [
-        {"id": 1, "hostname": "h1", "status": "offline", "last_heartbeat": None,
+        {"id": 1, "hostname": "h1", "status": "offline", "last_seen": None,
          "cluster_id": 1, "cluster_name": "c1"},
     ]
     out = await check_agents(conn, [1])
@@ -444,14 +444,57 @@ async def test_check_agents_warn_when_none_active():
 async def test_check_agents_ok_with_active():
     conn = AsyncMock()
     conn.fetch.return_value = [
-        {"id": 1, "hostname": "h1", "status": "active", "last_heartbeat": None,
+        {"id": 1, "hostname": "h1", "status": "active", "last_seen": None,
          "cluster_id": 1, "cluster_name": "c1"},
-        {"id": 2, "hostname": "h2", "status": "offline", "last_heartbeat": None,
+        {"id": 2, "hostname": "h2", "status": "offline", "last_seen": None,
          "cluster_id": 1, "cluster_name": "c1"},
     ]
     out = await check_agents(conn, [1])
     assert out["status"] == "ok"
     assert "1 of 2" in out["message"]
+
+
+@pytest.mark.asyncio
+async def test_bulgu84_check_agents_uses_last_seen_column():
+    """Bulgu #84 (round-23 audit) — pin the SQL column name.
+
+    Pre-fix the query referenced a non-existent ``a.last_heartbeat``
+    column. AsyncMock returns whatever dict the test sets without
+    re-validating the SQL string, so the pre-fix test suite was
+    GREEN while every live ACME preflight call (the
+    ``POST /api/sites/preflight-acme`` endpoint that the wizard
+    runs before showing the ACME step) crashed with
+    ``UndefinedColumnError: column a.last_heartbeat does not
+    exist``. The crash blocked the entire wizard ACME preview
+    page on a production cluster, but unit tests never noticed
+    because they only assert on the helper's return shape, not
+    on the SQL string the helper sends to Postgres.
+
+    This pin inspects ``conn.fetch.call_args`` to assert the SQL
+    body actually queries ``a.last_seen`` (the canonical column
+    name used everywhere else in the codebase — see
+    routers/cluster.py:695-702 and routers/agent.py:281+ for
+    sibling readers). A future ``last_heartbeat`` typo would
+    re-fail this test without anyone noticing the live impact.
+    """
+    conn = AsyncMock()
+    conn.fetch.return_value = [
+        {"id": 1, "hostname": "h1", "status": "active", "last_seen": None,
+         "cluster_id": 1, "cluster_name": "c1"},
+    ]
+    await check_agents(conn, [1])
+    conn.fetch.assert_awaited_once()
+    sql_query = conn.fetch.call_args[0][0]
+    assert "a.last_seen" in sql_query, (
+        f"check_agents SQL must select a.last_seen (the canonical "
+        f"agents-table timestamp column); got: {sql_query!r}"
+    )
+    assert "a.last_heartbeat" not in sql_query, (
+        f"check_agents SQL still references a.last_heartbeat — this "
+        f"column does NOT exist on the agents table and the query "
+        f"will 500 with UndefinedColumnError at runtime. SQL: "
+        f"{sql_query!r}"
+    )
 
 
 # ----------------------------------------------------------------------------

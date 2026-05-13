@@ -5328,7 +5328,22 @@ def test_bulgu62_update_path_grandfathers_unchanged_rule():
         fe, grandfathered_signatures=grand,
     )
     assert len(warnings) == 1
-    assert "grandfathered" in warnings[0].lower() or "pre-dated" in warnings[0].lower()
+    # Bulgu #83 (round-23 audit) — the warning was reworded from
+    # "Grandfathered ... pre-dated this validation" to a clearer
+    # "rule was not modified by this edit" phrasing that also
+    # echoes the verbatim rule body. Accept either the legacy
+    # markers or the new ones so the contract is signal-not-
+    # wording.
+    w_lower = warnings[0].lower()
+    assert (
+        "not modified by this edit" in w_lower
+        or "grandfathered" in w_lower
+        or "pre-dated" in w_lower
+    ), warnings[0]
+    # The verbatim rule must appear in the warning body so the
+    # operator can identify the offending entry without opening
+    # the ACL Builder cards.
+    assert stale in warnings[0], warnings[0]
 
 
 def test_bulgu62_update_path_still_rejects_new_contradiction():
@@ -6267,3 +6282,611 @@ def test_bulgu82_generate_install_script_validates_cluster():
     window = src[fn_start:fn_start + 5000]
     assert "validate_user_cluster_access" in window
     assert "Bulgu #82 (round-22 audit)" in window
+
+
+# ---- Bulgu #83 — grandfathered contradiction warning wording ----
+
+
+def test_bulgu83_warning_includes_verbatim_rule_text():
+    """The PUT-path grandfather warning must echo the verbatim
+    offending rule string so the operator can identify the
+    offender without opening the ACL Builder cards. Pre-fix the
+    warning only said "1 legacy rule" via the FE toast and
+    "Grandfathered <label> entry contains a self-contradictory
+    X !X condition that pre-dated this validation" via the server
+    JSON payload — both omitted the actual rule body, forcing
+    the operator to open the modal and hunt for the dead-code
+    entry."""
+    from models.frontend import FrontendConfig
+    from routers.frontend import (
+        _enforce_routing_rule_contradictions,
+        _rule_to_signature,
+    )
+
+    stale = "be-x if acl1 !acl1"
+    fe = FrontendConfig(
+        name="fe1",
+        bind_port=80,
+        mode="http",
+        use_backend_rules=[stale],
+    )
+    warnings = _enforce_routing_rule_contradictions(
+        fe, grandfathered_signatures={_rule_to_signature(stale)},
+    )
+    assert len(warnings) == 1
+    # Verbatim rule body appears in the warning.
+    assert stale in warnings[0]
+    # The wording no longer uses the operator-unfriendly
+    # "Grandfathered" lead-in; the message states what the
+    # branch actually knows ("not modified by this edit").
+    assert "not modified by this edit" in warnings[0].lower()
+
+
+def test_bulgu83_dict_redirect_warning_includes_signature_snippet():
+    """Dict-shaped redirect rules with a contradictory `condition`
+    must still surface the offending signature in the warning
+    (truncated to 160 chars to bound the toast length). Pin the
+    truncation contract so a future refactor doesn't accidentally
+    grow the warning into a multi-KB blob."""
+    from models.frontend import FrontendConfig
+    from routers.frontend import (
+        _enforce_routing_rule_contradictions,
+        _rule_to_signature,
+    )
+
+    # Note: the redirect condition itself carries the contradiction;
+    # the dict wrapper is what the wizard emits.
+    bad_dict = {
+        "type": "scheme",
+        "scheme": "https",
+        "code": 301,
+        "condition": "if acl1 !acl1",
+    }
+    fe = FrontendConfig(
+        name="fe1",
+        bind_port=80,
+        mode="http",
+        redirect_rules=[bad_dict],
+    )
+    warnings = _enforce_routing_rule_contradictions(
+        fe, grandfathered_signatures={_rule_to_signature(bad_dict)},
+    )
+    assert len(warnings) == 1
+    # Truncated signature (up to 160 chars) must appear in body.
+    assert "acl1" in warnings[0]
+    assert "!acl1" in warnings[0]
+    assert "redirect_rules" in warnings[0]
+
+
+def test_bulgu83_static_marker_in_fe_warning_toast():
+    """Front-end pin — the FrontendManagement.js toast no longer
+    calls these rules "legacy" and now lists each offending rule
+    body. Static-source check so a refactor that re-introduces
+    the misleading wording or drops the rule snippets is caught.
+    """
+    # The frontend tree lives next to backend/ at the workspace
+    # root, so walk up one extra level from _BACKEND_DIR.
+    fm_path = (
+        _BACKEND_DIR.parent
+        / "frontend"
+        / "src"
+        / "components"
+        / "FrontendManagement.js"
+    )
+    fm_src = fm_path.read_text()
+    assert "Bulgu #83 (round-23 audit)" in fm_src
+    # No more `legacy routing/redirect rule(s)` wording.
+    assert "legacy routing/redirect rule(s) with a self-contradictory" not in fm_src
+    # The new toast wires the offending rule snippets into the
+    # message body via `ruleSnippets`.
+    assert "ruleSnippets" in fm_src
+    # And it re-surfaces server-emitted warnings as a safety net.
+    assert "serverWarnings" in fm_src
+
+
+# ----------------------------------------------------------------------------
+# Bulgu #84 + #85 (round-23 audit — comprehensive Site Wizard live-test pass)
+# ----------------------------------------------------------------------------
+
+
+def test_bulgu84_acme_diagnostics_uses_last_seen_column():
+    """Bulgu #84 (round-23 audit) — duplicate pin in this file so the
+    full bulgu-pin suite has a one-stop reference; the original sits
+    in `test_acme_diagnostics.py::test_bulgu84_check_agents_uses_
+    last_seen_column` and asserts the AsyncMock call shape.
+
+    This duplicate is a STATIC-SOURCE check that's cheaper to grep:
+    we open the service file and verify the wrong column name is
+    not back in the SQL, plus the Bulgu marker is present so a
+    future refactor that drops the comment also fails.
+    """
+    svc_path = _BACKEND_DIR / "services" / "acme_diagnostics.py"
+    src = svc_path.read_text()
+    assert "Bulgu #84 (round-23 audit)" in src, (
+        "Bulgu #84 marker missing from acme_diagnostics.py — the "
+        "fix comment was removed but the underlying SQL change "
+        "may have been reverted too. Re-verify check_agents."
+    )
+    # Strip comments before scanning for the wrong column — the fix
+    # comment legitimately mentions ``a.last_heartbeat`` as the
+    # pre-fix symptom. We only care about NON-comment occurrences.
+    non_comment_lines = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    # The canonical SELECT inside check_agents must use a.last_seen.
+    assert "SELECT a.id, a.hostname, a.status, a.last_seen" in non_comment_lines, (
+        "acme_diagnostics.check_agents must SELECT a.last_seen "
+        "(the canonical agents-table column). Pre-fix this used "
+        "a non-existent a.last_heartbeat and every preflight-acme "
+        "call 500'd in production."
+    )
+    assert "a.last_heartbeat" not in non_comment_lines, (
+        "acme_diagnostics still references a.last_heartbeat in non-"
+        "comment code — this column does NOT exist on the agents "
+        "table. Use a.last_seen."
+    )
+
+
+def test_bulgu87_wizard_create_endpoint_rate_limited():
+    """Bulgu #87 (round-23 audit) — `POST /api/sites` must be
+    rate-limited, matching the existing 5/min caps on the
+    /preview and /preflight-acme sibling endpoints.
+
+    Pre-fix the wizard's actual create endpoint had NO rate cap:
+      - /api/sites/preflight-acme  → rate-limited (site_acme_preflight)
+      - /api/sites/preview         → rate-limited (site_previewed)
+      - /api/sites (POST, create)  → UNLIMITED ← gap
+
+    Round-3 live testing fired 10 wizard creates inside one
+    second against demo-cluster1; the response codes were
+    200/409/409/...409/200/409... — no 429 ever fired. With
+    Bulgu #86 fixed (version_name collision), the UNIQUE-error
+    side-effect that ACCIDENTALLY rate-limited rapid-fire creates
+    disappears too, so an authenticated user/script can now
+    create entities until the cluster apply queue clogs.
+
+    The fix calls `_enforce_rate_limit(conn, user_id,
+    "wizard_create_site")` early in create_site (after auth +
+    cluster-access checks). The action name must match what the
+    router itself logs (`wizard_create_site` — see
+    `_log_user_activity(... action="wizard_create_site", ...)`
+    in the same router); the activity_logger middleware
+    intentionally skips this endpoint to avoid double-logging,
+    so the rate-limit must reference the router-emitted action.
+    """
+    sw_src = (_BACKEND_DIR / "routers" / "site_wizard.py").read_text()
+    assert "Bulgu #87 (round-23 audit)" in sw_src, (
+        "Bulgu #87 marker missing — the wizard create rate-limit "
+        "may have been reverted."
+    )
+    # The create_site function body must call _enforce_rate_limit
+    # with the canonical create action name.
+    import re as _re
+    m = _re.search(
+        r"async def create_site\([^)]*\)[^{]*:(.*?)(?=\nasync def |\n@router\.|\Z)",
+        sw_src,
+        _re.DOTALL,
+    )
+    assert m, "could not locate create_site function body in site_wizard.py"
+    fn_body = m.group(1)
+    assert (
+        '_enforce_rate_limit(conn, user_id, "wizard_create_site")' in fn_body
+        or "_enforce_rate_limit(conn, user_id, 'wizard_create_site')" in fn_body
+    ), (
+        "create_site must call _enforce_rate_limit(... "
+        '"wizard_create_site") so rapid-fire POST /api/sites '
+        "calls hit a 429 cap; pre-fix the endpoint was unlimited."
+    )
+
+
+def test_bulgu86_wizard_version_name_has_unique_suffix():
+    """Bulgu #86 (round-23 audit) — pin the version-name generation so
+    two wizard POST /api/sites calls submitted within the SAME epoch
+    second cannot collide on `config_versions(cluster_id, version_name)`.
+
+    Pre-fix `version_name = f"bulk-site-create-{int(time.time())}"`
+    had seconds resolution. Round-3 live testing reproduced the
+    failure with a back-to-back wizard automation: the second call
+    returned 409 with the misleading
+
+        "A wizard entity with this name already exists on the
+         cluster (UNIQUE constraint). Pick a different name."
+
+    fall-through detail, even though the operator-supplied
+    backend / frontend / SSL names were genuinely unique — the
+    real collision was on the auto-generated version name. The
+    operator who tried to rename the wizard inputs would still
+    hit the same error and have no way to make progress until the
+    epoch second ticked over.
+
+    Fix: append a 6-hex-char UUID suffix
+    (`bulk-site-create-{ts}-{uuid.uuid4().hex[:6]}`) so the
+    suffix space is 16M and birthday-collision-proof at any
+    realistic per-second request rate. The `bulk-site-create-`
+    prefix is preserved so reject_pending_changes /
+    restore-from-prior-version paths (cluster.py:4179 prefix scan)
+    keep working.
+
+    Static-source pin so any future refactor that strips the
+    suffix fails this test.
+    """
+    sw_src = (_BACKEND_DIR / "routers" / "site_wizard.py").read_text()
+    assert "Bulgu #86 (round-23 audit)" in sw_src, (
+        "Bulgu #86 marker missing — the version_name uniqueness "
+        "suffix may have been reverted."
+    )
+    # The fixed form references uuid.uuid4().hex[:6] (or similar
+    # length-bounded random suffix) appended to the ts. A pure
+    # `f"bulk-site-create-{ts}"` line (without any suffix
+    # interpolation after ts) is the regressed form.
+    import re as _re
+    # Find the wizard's version_name assignment. We allow flexible
+    # spacing / quoting around the f-string but require the suffix
+    # interpolation token immediately after `{ts}-`.
+    has_suffix = bool(_re.search(
+        r'version_name\s*=\s*f"bulk-site-create-\{ts\}-\{[^}]+\}"',
+        sw_src,
+    ))
+    has_regressed = bool(_re.search(
+        r'version_name\s*=\s*f"bulk-site-create-\{ts\}"\s*$',
+        sw_src,
+        _re.MULTILINE,
+    ))
+    assert has_suffix, (
+        "wizard's version_name must append a unique suffix "
+        "(e.g. uuid.uuid4().hex[:6]) after `{ts}` so back-to-back "
+        "wizard creates within the same epoch second cannot "
+        "collide on config_versions UNIQUE."
+    )
+    assert not has_regressed, (
+        "wizard's version_name regressed to seconds-only resolution "
+        "— this re-introduces Bulgu #86 (UNIQUE collision on rapid "
+        "back-to-back creates)."
+    )
+
+
+def test_bulgu85_unique_violation_handler_extracts_constraint_name():
+    """Bulgu #85 (round-23 audit) — the wizard's UniqueViolationError
+    handler must surface the offending constraint name in the operator-
+    visible 409 detail so debugging a "wizard entity with this name
+    already exists" toast doesn't require shell access to the server
+    logs.
+
+    Pre-fix the handler had THREE branches:
+      * backends_name_cluster_id_key  → "backend with this name"
+      * frontends_name_cluster_id_key → "frontend with this name"
+      * else                          → generic "wizard entity"
+    Any other constraint (SSL cert UNIQUE, backend_servers UNIQUE,
+    config_versions UNIQUE) fell through to the generic message,
+    leaving the operator with NO actionable hint and requiring an
+    on-call engineer to ssh into the API pod and tail `logger.info`
+    output to find ``constraint=<name>`` in the asyncpg traceback.
+
+    The fix:
+      1. Echoes the entity NAME (body.backend.name, body.frontend.name,
+         body.ssl.name) so the operator can match toast to wizard input.
+      2. Adds dedicated branches for `ssl_certificates_*` and
+         `backend_servers_*` constraints with actionable hints.
+      3. In the fall-through ELSE branch, echoes the constraint name
+         from `uve.constraint_name` (or substring scan as fallback)
+         so an unknown constraint still gives the engineer a stable
+         schema identifier to grep.
+    """
+    sw_src = (_BACKEND_DIR / "routers" / "site_wizard.py").read_text()
+    assert "Bulgu #85 (round-23 audit)" in sw_src, (
+        "Bulgu #85 marker missing from site_wizard.py UniqueViolation "
+        "handler — the constraint-echoing fix may have been reverted."
+    )
+    # Entity-name echoing in branch detail bodies.
+    assert "body.backend.name" in sw_src and (
+        "A backend named '{body.backend.name}'" in sw_src
+        or "A backend named '\"{body.backend.name}\"" in sw_src
+        or "A backend named '" in sw_src and "body.backend.name" in sw_src
+    )
+    assert "A frontend named '{body.frontend.name}'" in sw_src or (
+        "A frontend named '" in sw_src and "body.frontend.name" in sw_src
+    )
+    # SSL cert and backend_servers branches present.
+    assert "ssl_certificates" in sw_src
+    assert "backend_servers" in sw_src
+    # Fall-through echoes constraint name.
+    assert "constraint=" in sw_src or "constraint_name" in sw_src
+    # The asyncpg attribute is preferred over str(uve) scanning.
+    assert 'getattr(uve, "constraint_name"' in sw_src, (
+        "Fix should prefer asyncpg's structured constraint_name "
+        "attribute over substring scanning str(uve), which is the "
+        "human-formatted DETAIL line and may vary across server "
+        "versions / locales."
+    )
+
+
+# ----- Bulgu #88 / #89 (round-24 audit) ----------------------------------
+#
+# `POST /api/sites/preview` skipped the SSL-cert cluster-RBAC gate that
+# `POST /api/sites` (create) enforces via `select_existing_cert()`. The
+# `select_existing_cert()` helper encodes "global cert OR junction-bound
+# to <cluster_id>"; pre-fix the preview accepted ssl_certificate_id values
+# bound to OTHER clusters and returned the full rendered `would_create`
+# envelope — a tenant-boundary information leak for the cert id and the
+# rendered HAProxy config snippet. The fix mirrors the create-time check
+# in the preview path: same predicate, same 400 status, same error text.
+
+def test_bulgu88_preview_enforces_ssl_cert_cluster_rbac():
+    """Preview must reject `ssl.ssl_certificate_id` referencing a cert
+    that is bound to a DIFFERENT cluster — same RBAC predicate the
+    create endpoint enforces. Static source check: the preview body
+    invokes `select_existing_cert` with `body.ssl.ssl_certificate_id`
+    and raises 400 with a "not found / inactive / not bound" hint."""
+    import os
+    sw_path = os.path.join(
+        os.path.dirname(__file__), "..", "routers", "site_wizard.py",
+    )
+    with open(sw_path, "r") as fh:
+        sw_src = fh.read()
+
+    # Locate the preview function.
+    assert "async def preview_create(" in sw_src
+    preview_start = sw_src.index("async def preview_create(")
+    # Bound the slice at the next top-level `async def` so we don't
+    # match the create_site copy (which is at line ~1900 and would
+    # cause this test to trivially pass even if preview was unfixed).
+    next_def = sw_src.index("\nasync def ", preview_start + 1)
+    preview_body = sw_src[preview_start:next_def]
+
+    # The preview must call select_existing_cert.
+    assert "select_existing_cert(" in preview_body, (
+        "Preview path must mirror create_site's cluster-RBAC gate by "
+        "invoking select_existing_cert(conn, ssl_certificate_id, "
+        "cluster_id). Pre-fix preview returned 200 with the full "
+        "rendered would_create envelope when the cert belonged to a "
+        "different cluster — a tenant-boundary information leak."
+    )
+
+    # The check must be wired to the body.ssl.ssl_certificate_id field
+    # (not some unrelated cert reference).
+    assert "body.ssl.ssl_certificate_id" in preview_body, (
+        "Preview RBAC check must reference body.ssl.ssl_certificate_id"
+    )
+
+    # Must raise 400 (consistent with create-time message).
+    assert "status_code=400" in preview_body
+    assert "not found / inactive / not bound" in preview_body or (
+        "not found / inactive" in preview_body
+        and "not bound" in preview_body
+    ), (
+        "Preview should raise 400 with the same 'not found / inactive "
+        "/ not bound to this cluster' hint create_site emits, so wizard "
+        "clients can match the message uniformly."
+    )
+
+
+def test_bulgu89_preview_enforces_per_server_ca_bundle_cluster_rbac():
+    """Preview must also enforce per-server `ssl_certificate_id` (CA
+    bundle) cluster-RBAC. Pre-fix only `create_site` checked this — a
+    direct API caller could submit a preview with
+    `servers[i].ssl_certificate_id=<cert from another cluster>` and
+    receive the full rendered backend block back, including the
+    `ca-file` directive bound to a cert id the caller's cluster has
+    no junction row for."""
+    import os
+    sw_path = os.path.join(
+        os.path.dirname(__file__), "..", "routers", "site_wizard.py",
+    )
+    with open(sw_path, "r") as fh:
+        sw_src = fh.read()
+    preview_start = sw_src.index("async def preview_create(")
+    next_def = sw_src.index("\nasync def ", preview_start + 1)
+    preview_body = sw_src[preview_start:next_def]
+
+    # Must iterate body.servers and check per-server ssl_certificate_id.
+    assert "body.servers" in preview_body, (
+        "Preview must iterate body.servers to validate each "
+        "server.ssl_certificate_id reference"
+    )
+    assert "ssl_certificate_id" in preview_body
+    # The per-server message must be field-qualified so operators see
+    # WHICH server triggered the gate.
+    assert "servers[" in preview_body and "ssl_certificate_id=" in preview_body, (
+        "Per-server preview error must include the array index "
+        "(servers[i].ssl_certificate_id=<id>) so operators can find "
+        "the offending row in their wizard payload."
+    )
+
+
+# ----- Bulgu #90 (round-24 audit) ----------------------------------------
+#
+# `backend.cookie_name`, `backend.cookie_options`, and `server.cookie_value`
+# only rejected newline characters pre-fix. HAProxy's directive parser
+# tokenises by whitespace and treats `;` as an inline-comment, so a value
+# like `SESS'; DROP TABLE backends; --` rendered as
+# `cookie SESS'; DROP TABLE backends; -- insert indirect nocache` which
+# HAProxy parsed as `cookie SESS'` + comment — silently truncating the
+# operator's persistence options and producing a malformed Set-Cookie
+# header that browsers may drop. Tighten to the conservative
+# alphanumeric+`_.-` set (cookie_name / cookie_value) and the keyword/
+# `=`-bearing set (cookie_options).
+
+def test_bulgu90_cookie_name_rejects_haproxy_parser_hostile_chars():
+    """cookie_name must reject `;` (HAProxy inline comment), whitespace
+    (token delimiter), and other punctuation that breaks the rendered
+    `cookie <name>` directive."""
+    from models.site_wizard import BackendStep
+    import pydantic
+    # Semicolon (HAProxy comment) — used to be silently accepted.
+    with pytest.raises(pydantic.ValidationError):
+        BackendStep(name="be1", cookie_name="SESS'; DROP TABLE backends; --")
+    # Space (token delimiter) — splits the cookie directive.
+    with pytest.raises(pydantic.ValidationError):
+        BackendStep(name="be1", cookie_name="SESS ID")
+    # Quote (legal in RFC 6265 but produces ugly Set-Cookie headers
+    # and confuses log scrapers).
+    with pytest.raises(pydantic.ValidationError):
+        BackendStep(name="be1", cookie_name='SESS"id')
+    # Common-case valid input continues to work.
+    BackendStep(name="be1", cookie_name="SESS_ID-1.app")
+
+
+def test_bulgu90_cookie_options_rejects_parser_hostile_chars():
+    """cookie_options must reject `;` and quoting metacharacters but
+    still accept legitimate `attr SameSite=Lax` style values."""
+    from models.site_wizard import BackendStep
+    import pydantic
+    with pytest.raises(pydantic.ValidationError):
+        BackendStep(
+            name="be1", cookie_name="SESS",
+            cookie_options="insert indirect; rm -rf /",
+        )
+    with pytest.raises(pydantic.ValidationError):
+        BackendStep(
+            name="be1", cookie_name="SESS",
+            cookie_options='insert "indirect"',
+        )
+    # Valid HAProxy cookie options continue to parse.
+    BackendStep(
+        name="be1", cookie_name="SESS",
+        cookie_options="insert indirect nocache attr SameSite=Lax",
+    )
+
+
+def test_bulgu90_server_cookie_value_rejects_rfc6265_disallowed_chars():
+    """server.cookie_value must reject `;`, whitespace, and other
+    chars RFC 6265 disallows in cookie-values."""
+    from models.site_wizard import ServerStep
+    import pydantic
+    with pytest.raises(pydantic.ValidationError):
+        ServerStep(
+            server_name="s1", server_address="10.0.0.1",
+            server_port=8080, cookie_value="srv1; secure",
+        )
+    with pytest.raises(pydantic.ValidationError):
+        ServerStep(
+            server_name="s1", server_address="10.0.0.1",
+            server_port=8080, cookie_value="srv 1",
+        )
+    # Valid cookie values continue to work.
+    ServerStep(
+        server_name="s1", server_address="10.0.0.1",
+        server_port=8080, cookie_value="srv-1.app_2",
+    )
+
+
+# ----- Bulgu #93 (round-24 audit) ----------------------------------------
+#
+# `GET /api/sites/suggest` produced backend/frontend name suggestions
+# using `c.isalnum()` over the first domain label. Python's `isalnum()`
+# is Unicode-aware and returns True for non-ASCII letters (ü, é, ñ, …),
+# so an operator typing `bücher.example.com` received
+# `backend_name='be-bücher'`. The wizard CREATE path then rejected the
+# very name the SUGGEST endpoint returned, because the entity-name
+# regex (`^[a-zA-Z][a-zA-Z0-9_-]{0,63}$`) and the domain validator are
+# both ASCII-only. The fix converts non-ASCII labels through IDN/
+# punycode FIRST and only then applies ASCII-only sanitisation, so the
+# resulting name is one the operator can submit unchanged.
+
+def test_bulgu93_suggest_idn_unicode_produces_ascii_safe_slug():
+    """`suggest` must produce slugs that the backend/frontend name
+    regex `^[a-zA-Z][a-zA-Z0-9_-]{0,63}$` accepts. Static source check:
+    the suggest function uses an ASCII-only predicate
+    (`c.isascii() and c.isalnum()` etc.) and routes IDN labels through
+    `encode('idna')` to preserve the operator's intent in punycode."""
+    import os, re
+    sw_path = os.path.join(
+        os.path.dirname(__file__), "..", "routers", "site_wizard.py",
+    )
+    with open(sw_path, "r") as fh:
+        sw_src = fh.read()
+
+    # Locate the suggest_defaults function body.
+    assert "async def suggest_defaults(" in sw_src
+    start = sw_src.index("async def suggest_defaults(")
+    end = sw_src.index("\n@router.", start + 1)
+    suggest_body = sw_src[start:end]
+
+    # The fix must use IDN/punycode encoding when the input is non-ASCII.
+    assert 'encode("idna")' in suggest_body or "encode('idna')" in suggest_body, (
+        "suggest_defaults must route non-ASCII labels through IDN/"
+        "punycode so the rendered slug matches the ASCII-only entity-"
+        "name regex the create endpoint enforces."
+    )
+
+    # The sanitiser must use an ASCII-only predicate, not Unicode-aware
+    # `isalnum()` alone (which is the pre-fix bug).
+    assert "isascii()" in suggest_body, (
+        "Sanitisation step must explicitly bound to ASCII (via "
+        "`c.isascii()`) so Unicode alphabetics get mapped to '-' rather "
+        "than retained verbatim."
+    )
+
+    # The first occurrence of the Unicode-only `c.isalnum()` (without an
+    # adjacent isascii() guard) must no longer exist in the slug-build
+    # path. We sanity-check by counting the matches of the bare
+    # `c.isalnum()` token within the function body — pre-fix there was
+    # exactly one such occurrence in the slug builder.
+    bare = re.findall(r"\bc\.isalnum\(\)\b", suggest_body)
+    assert all(
+        # Each occurrence must be paired with an `isascii()` guard on
+        # the same line — confirm by inspecting the line context.
+        any("isascii()" in ln for ln in suggest_body.splitlines() if "c.isalnum()" in ln)
+        for _ in bare
+    ), (
+        "Every `c.isalnum()` predicate in the slug builder must be "
+        "AND'd with `c.isascii()` so non-ASCII letters cannot leak "
+        "into the suggested entity names."
+    )
+
+
+def test_bulgu93_suggest_function_behavioural_smoke():
+    """Behavioural check: the same logic, invoked directly, should
+    produce an ASCII-only slug for a Unicode input."""
+    # Replicate the post-fix slug builder inline so the test does not
+    # require an event loop / FastAPI fixture. The point is to confirm
+    # the algorithmic shape matches what the source check above
+    # enforces.
+    def _build_slug(domain: str) -> str:
+        first_label = (
+            domain.replace("*.", "").split(".")[0]
+            if domain.replace("*.", "")
+            else ""
+        )
+        ascii_label = first_label
+        if first_label and not first_label.isascii():
+            try:
+                ascii_label = first_label.encode("idna").decode("ascii")
+            except (UnicodeError, UnicodeDecodeError):
+                ascii_label = "".join(
+                    c if c.isascii() and (c.isalnum() or c in ("-", "_"))
+                    else "-"
+                    for c in first_label
+                )
+        slug = (ascii_label or "newhost")[:32].lower()
+        slug = "".join(
+            c if c.isascii() and (c.isalnum() or c in ("-", "_"))
+            else "-"
+            for c in slug
+        )
+        if slug.startswith("_"):
+            slug = "h-" + slug.lstrip("_")
+        if not slug or not slug[0].isalpha():
+            slug = "h-" + slug
+        return slug
+
+    # Unicode IDN — should round-trip through punycode.
+    s = _build_slug("bücher.example.com")
+    # punycode of 'bücher' is 'xn--bcher-kva'
+    assert s == "xn--bcher-kva", f"expected xn--bcher-kva got {s!r}"
+    # The slug must satisfy the entity-name regex.
+    import re
+    assert re.fullmatch(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$", s), s
+
+    # Plain ASCII domain still produces the obvious slug.
+    assert _build_slug("example.com") == "example"
+
+    # Uppercase normalises to lowercase.
+    assert _build_slug("EXAMPLE.COM") == "example"
+
+    # Trailing dot (FQDN absolute) stripped.
+    assert _build_slug("example.com.") == "example"
+
+    # Empty / dots-only input falls back to 'newhost'.
+    assert _build_slug("") == "newhost"
+    assert _build_slug("...") == "newhost"

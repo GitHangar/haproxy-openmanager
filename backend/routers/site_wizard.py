@@ -1046,9 +1046,45 @@ async def suggest_defaults(
 
         slug = "newhost"
         if domain:
-            base = domain.replace("*.", "").split(".")
-            slug = (base[0] or "newhost")[:32].lower()
-            slug = "".join(c if (c.isalnum() or c in ("-", "_")) else "-" for c in slug)
+            # Bulgu #93 (round-24 audit) — IDN / Unicode safety. PRE-FIX
+            # the suggest endpoint used `c.isalnum()`, which is Unicode-
+            # aware and returns True for non-ASCII letters (ü, é, ñ, …).
+            # An operator who typed `bücher.example.com` got back
+            # `backend_name="be-bücher"`, dropped that into the wizard
+            # form, and then hit a hard 422 at create time because the
+            # backend/frontend name validator regex
+            # `^[a-zA-Z][a-zA-Z0-9_-]{0,63}$` is ASCII-only. The wizard
+            # CREATE path also forces the domain itself through punycode
+            # (the validator rejects raw Unicode with a "use 'xn--…'"
+            # hint). Make `suggest` honour the same on-the-wire ASCII
+            # contract: convert each label to its IDN/punycode form
+            # FIRST, then sanitise to the alphanumeric / `-_` set the
+            # entity-name regex permits. The result is a name the
+            # operator can submit to /api/sites without re-typing.
+            first_label = (
+                domain.replace("*.", "").split(".")[0]
+                if domain.replace("*.", "")
+                else ""
+            )
+            ascii_label = first_label
+            if first_label and not first_label.isascii():
+                try:
+                    ascii_label = first_label.encode("idna").decode("ascii")
+                except (UnicodeError, UnicodeDecodeError):
+                    # IDN encoding failed (empty label, invalid chars,
+                    # etc.) — fall back to stripping non-ASCII to '-'
+                    # so we still produce a usable slug.
+                    ascii_label = "".join(
+                        c if c.isascii() and (c.isalnum() or c in ("-", "_"))
+                        else "-"
+                        for c in first_label
+                    )
+            slug = (ascii_label or "newhost")[:32].lower()
+            slug = "".join(
+                c if c.isascii() and (c.isalnum() or c in ("-", "_"))
+                else "-"
+                for c in slug
+            )
             if slug.startswith("_"):
                 slug = "h-" + slug.lstrip("_")
             if not slug or not slug[0].isalpha():
@@ -1145,6 +1181,53 @@ async def preview_create(
     conn = await get_database_connection()
     try:
         await _validate_user_cluster_access(current_user["id"], body.cluster_id, conn)
+
+        # Bulgu #88 / #89 (round-24 audit) — cluster-RBAC parity with
+        # `create_site` for SSL certificate references. PRE-FIX the
+        # preview path (`POST /api/sites/preview`) skipped the
+        # `select_existing_cert()` gate that `create_site` runs at
+        # lines 2298-2308 (per-server CA bundle) and 2398-2405
+        # (HTTPS bind cert). The omission let an authenticated wizard
+        # user pass `ssl.mode='existing', ssl_certificate_id=<X>` (or
+        # `servers[i].ssl_certificate_id=<X>`) where cert `X` belongs
+        # to a DIFFERENT cluster and receive the full rendered
+        # `would_create` envelope back — leaking cert id metadata
+        # across tenant boundaries. The actual submit (`POST /api/
+        # sites`) does enforce the gate, so this is a preview-only
+        # information leak, not a write-path escalation. The fix is
+        # to mirror the same `select_existing_cert(conn, id, cluster_
+        # id)` predicate (which already encodes the "global OR
+        # junction-bound" rule defined in `ssl_service.py:331-370`)
+        # so the preview returns 400 with a clear hint rather than
+        # 200 with a leaked render. We deliberately keep the error
+        # phrasing identical to the create-time message so wizard
+        # UI handlers that already match on "not found / inactive"
+        # need no client changes.
+        if body.ssl.mode == "existing" and body.ssl.ssl_certificate_id:
+            _preview_resolved = await select_existing_cert(
+                conn, body.ssl.ssl_certificate_id, body.cluster_id,
+            )
+            if not _preview_resolved:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"ssl_certificate_id {body.ssl.ssl_certificate_id} "
+                        "not found / inactive / not bound to this cluster"
+                    ),
+                )
+        for _idx, _srv in enumerate(body.servers or []):
+            _srv_cert_id = getattr(_srv, "ssl_certificate_id", None)
+            if _srv_cert_id:
+                if not await select_existing_cert(
+                    conn, _srv_cert_id, body.cluster_id,
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"servers[{_idx}].ssl_certificate_id={_srv_cert_id} "
+                            "not found / inactive / not bound to this cluster"
+                        ),
+                    )
 
         # Phase K Phase C: rate-limit ONLY the dry-run code path so
         # legacy callers (e.g. `SiteDrafts.handlePreview` which never
@@ -1848,6 +1931,28 @@ async def create_site(
     try:
         await _validate_user_cluster_access(user_id, body.cluster_id, conn)
 
+        # Bulgu #87 (round-23 audit) — rate-limit the actual create
+        # endpoint. Pre-fix /api/sites/preview and
+        # /api/sites/preflight-acme were rate-limited (5/min, see
+        # `_enforce_rate_limit` callers above) but POST /api/sites
+        # itself had NO cap. Round-3 live testing fired 10 wizard
+        # creates in a single second against demo-cluster1; without
+        # the cap an authenticated user / script can spam-create
+        # entities until the cluster apply queue clogs.
+        #
+        # Action name must match what the router itself logs at the
+        # end of create_site (`wizard_create_site` — see
+        # `_log_user_activity(... action="wizard_create_site", ...)`
+        # at the success path below). The activity_logger middleware
+        # intentionally skips this endpoint to avoid double-logging
+        # (see middleware/activity_logger.py:74-110), so we must
+        # rate-limit on the SAME action the router emits.
+        #
+        # 5/min matches the preview / preflight budget — bulk
+        # operators have the dedicated /api/sites/bulk-import path
+        # for larger batches.
+        await _enforce_rate_limit(conn, user_id, "wizard_create_site")
+
         # ----- Pre-create checks (must succeed before transaction)
 
         # Phase 3 (R11-audit follow-up): reserved-name check parity with
@@ -2133,7 +2238,31 @@ async def create_site(
         # rebrand. The reject path on `cluster.py` recognises BOTH
         # prefixes so historical APPLIED versions (created before this
         # rename) keep behaving correctly during reject/undo.
-        version_name = f"bulk-site-create-{ts}"
+        #
+        # Bulgu #86 (round-23 audit) — append a short UUID suffix so
+        # two wizard POST /api/sites calls submitted within the SAME
+        # epoch second cannot collide on the
+        # `config_versions(cluster_id, version_name)` UNIQUE
+        # constraint. Pre-fix `version_name = f"bulk-site-create-{ts}"`
+        # gave seconds resolution, so an operator who clicked "Create"
+        # twice in rapid succession (or any back-to-back API
+        # automation) saw the SECOND call 409 with the generic
+        # `UniqueViolationError` fall-through message:
+        #
+        #     "A wizard entity with this name already exists on the
+        #      cluster (UNIQUE constraint). Pick a different name."
+        #
+        # — even though the operator-chosen backend / frontend / SSL
+        # names were unique. The actual collision was on the
+        # auto-generated `version_name` and re-naming the wizard
+        # inputs did NOT help. The reject_pending_changes path on
+        # cluster.py:4179 prefix-matches `bulk-site-create-*` so
+        # appending a unique suffix preserves the historical
+        # rollback / undo semantics. 6 hex chars give 16M-room before
+        # birthday collisions, vastly more than the per-second
+        # request volume an operator can sustain through the wizard.
+        import uuid
+        version_name = f"bulk-site-create-{ts}-{uuid.uuid4().hex[:6]}"
         bulk_snapshots: List[dict] = []
         created_ids: Dict[str, Any] = {}
 
@@ -2929,22 +3058,68 @@ async def create_site(
         # broke".
         msg = str(uve)
         logger.info(f"WIZARD: name conflict on create: {msg}")
-        if "backends_name_cluster_id_key" in msg or 'backends_name' in msg:
+        # Bulgu #85 (round-23 audit) — extract the offending constraint
+        # name from the asyncpg message so the operator-visible detail
+        # can pin-point WHICH entity collided. Pre-fix the handler only
+        # recognised `backends_*_key` and `frontends_*_key`; any other
+        # constraint (ssl_certificates, backend_servers, config_versions
+        # …) fell through to the generic "wizard entity with this name"
+        # message which is useless for debugging — the operator has to
+        # open the server log and the engineer has to ssh-bounce to
+        # extract `constraint=<name>` from the exception detail.
+        #
+        # ``asyncpg.UniqueViolationError.constraint_name`` is the
+        # canonical structured field; ``str(uve)`` only contains the
+        # human-formatted DETAIL line. Prefer the attribute, fall back
+        # to substring scanning so we stay robust if asyncpg ever stops
+        # exposing it.
+        constraint = getattr(uve, "constraint_name", None) or ""
+        msg_lower = msg.lower()
+        if "backends_name_cluster_id_key" in msg or 'backends_name' in msg \
+                or constraint == "backends_name_cluster_id_key":
             detail = (
-                "A backend with this name already exists on the cluster "
-                "(possibly soft-deleted). Pick a different backend name "
-                "or restore/permanently-delete the existing row."
+                f"A backend named '{body.backend.name}' already exists on "
+                "the cluster (possibly soft-deleted). Pick a different "
+                "backend name or restore/permanently-delete the existing "
+                "row."
             )
-        elif "frontends_name_cluster_id_key" in msg or "frontends_name" in msg:
+        elif "frontends_name_cluster_id_key" in msg or "frontends_name" in msg \
+                or constraint == "frontends_name_cluster_id_key":
             detail = (
-                "A frontend with this name already exists on the cluster "
+                f"A frontend named '{body.frontend.name}' (or its auto-"
+                f"derived HTTPS sibling) already exists on the cluster "
                 "(possibly soft-deleted). Pick a different frontend name "
                 "or restore/permanently-delete the existing row."
             )
-        else:
+        elif "ssl_certificates" in msg_lower or "ssl_certificates" in constraint \
+                or "ssl_cert" in constraint:
+            ssl_name = getattr(body.ssl, "name", None) or "(unnamed)"
             detail = (
-                "A wizard entity with this name already exists on the "
-                "cluster (UNIQUE constraint). Pick a different name."
+                f"An SSL certificate named '{ssl_name}' already exists on "
+                "the cluster (possibly soft-deleted). Pick a different "
+                "ssl.name or restore/permanently-delete the existing "
+                "certificate row."
+            )
+        elif "backend_servers" in msg_lower or "backend_servers" in constraint:
+            detail = (
+                "Two servers in the same backend share a server_name. "
+                "HAProxy requires `server <name>` tokens to be unique "
+                "within a backend block. Rename the duplicate(s) and "
+                "resubmit."
+            )
+        else:
+            # Echo the constraint name (a stable, non-secret schema
+            # identifier) in the detail so a human reading the toast
+            # can grep the codebase for the matching CREATE TABLE
+            # without needing server-log access. Names like
+            # `proxied_hosts_pkey` or `config_versions_unique` are
+            # safe to surface — they're public schema info.
+            con_hint = f" (constraint={constraint})" if constraint else ""
+            detail = (
+                f"A wizard entity with this name already exists on the "
+                f"cluster (UNIQUE constraint{con_hint}). Pick a different "
+                "name or retry; if the conflict persists contact the "
+                "platform team."
             )
         raise HTTPException(status_code=409, detail=detail)
     except Exception as e:

@@ -198,12 +198,28 @@ def _enforce_routing_rule_contradictions(
     for label, rule in conflicts:
         sig = _rule_to_signature(rule)
         if sig and sig in grandfathered_signatures:
+            # Bulgu #83 (round-23 audit) — re-word the operator-
+            # facing warning. The pre-fix message led with
+            # "Grandfathered <label> entry contains a self-
+            # contradictory X !X condition that pre-dated this
+            # validation", which (a) is internal jargon the
+            # operator does not parse, and (b) implies the rule
+            # is OLD when in fact the only thing this branch
+            # knows is that the rule was NOT changed by the
+            # current edit. The operator may well have authored
+            # the rule one minute earlier. State that explicitly
+            # and include the verbatim rule body so the operator
+            # does not have to hunt through the ACL Builder
+            # cards to find the offender.
+            rule_text = rule if isinstance(rule, str) else sig[:160]
             warnings.append(
-                f"Grandfathered {label} entry contains a "
-                f"self-contradictory `X !X` condition that pre-dated "
-                f"this validation. The rule never fires; fix it at "
-                f"your convenience. (rule: "
-                f"{rule if isinstance(rule, str) else sig[:160]})"
+                f"{label}: rule was not modified by this edit but "
+                f"contains a self-contradictory `X !X` condition "
+                f"(`X AND NOT X` is always false, so the rule never "
+                f"fires and traffic falls through to "
+                f"`default_backend`). Your current edit was saved; "
+                f"fix the rule at your convenience. "
+                f"(rule: {rule_text})"
             )
         else:
             blocking.append((label, rule))

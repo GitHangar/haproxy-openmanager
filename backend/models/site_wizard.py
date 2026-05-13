@@ -488,6 +488,32 @@ class ServerStep(BaseModel):
                     "splits at the first space, so a space inside the "
                     "SNI value would corrupt the rendered config."
                 )
+        # Bulgu #90 (round-24 audit) — `cookie_value` is interpolated
+        # into the rendered `server <name> <addr>:<port> ... cookie
+        # <value> ...` line. HAProxy tokenises the line by whitespace
+        # and treats `;` as an INLINE COMMENT — and RFC 6265 cookie-
+        # value grammar separately disallows whitespace, `;`, `,`,
+        # `\\` and `"`. Pre-fix the validator only rejected newlines,
+        # so an operator could set `cookie_value="srv1; secure"` and
+        # see HAProxy silently truncate the server line at `;`
+        # (everything after becomes a comment). The Set-Cookie header
+        # rendered to clients would also fail the RFC's cookie-value
+        # grammar and most browsers drop the cookie, breaking session
+        # affinity without any error surface. Restrict to the
+        # conservative intersection — alphanumeric plus `_.-` —
+        # identical to backend.cookie_name. Legitimate session
+        # identifiers all fit in this set.
+        if info and info.field_name == "cookie_value":
+            import re as _re
+            if not _re.fullmatch(r"[A-Za-z0-9_.\-]+", v):
+                raise ValueError(
+                    "server.cookie_value must contain only alphanumerics, "
+                    "'.', '_' or '-' (HAProxy tokenises the server line "
+                    "by whitespace and treats ';' as an inline comment; "
+                    "RFC 6265 separately disallows whitespace, ';', ',' "
+                    "and backslash in cookie values). Got "
+                    f"{v!r}."
+                )
         return v
     # R17 (label corrected R18): CA bundle used by HAProxy to VERIFY the
     # upstream server's TLS certificate. Maps to the `ca-file` directive
@@ -658,6 +684,32 @@ class BackendStep(BaseModel):
         fields like `request_headers` / `response_headers` /
         `tcp_request_rules` are intentionally line-oriented and ARE
         NOT touched here.
+
+        Bulgu #90 (round-24 audit) — extend the validator beyond
+        newlines. Pre-fix `cookie_name` accepted strings like
+        `SESS'; DROP TABLE backends; --` (the SQL substring is
+        harmless thanks to parameterised queries, but the `;` is
+        HAProxy's INLINE COMMENT character: the renderer emits
+        `cookie SESS'; DROP TABLE backends; -- insert indirect
+        nocache`, which HAProxy parses as `cookie SESS'` followed by
+        an inline comment that swallows the persistence options the
+        operator typed). Result: session affinity silently broken
+        and the operator has zero diagnostic signal — the wizard
+        accepted the input, the apply succeeded, but cookies never
+        get re-emitted with the expected name. The same trap exists
+        for any HAProxy-section-keyword or whitespace token because
+        HAProxy tokenises by space.
+
+        `cookie_name` MUST be a single token. We use the conservative
+        intersection of RFC 6265 cookie-token chars and HAProxy
+        directive-name chars: alphanumeric plus `_.-`. Operators
+        with legitimate session cookies all live inside this set.
+
+        `cookie_options` is a space-separated keyword list
+        (`insert indirect nocache` etc., optionally `domain example.
+        com`, `attr SameSite=Lax`). Allow letters/digits/space/dot/
+        hyphen/underscore/equals. Reject `;` (comment), backslash,
+        quotes, and other shell metacharacters.
         """
         if v is None:
             return v
@@ -669,6 +721,28 @@ class BackendStep(BaseModel):
                 "newlines would smuggle additional directives into "
                 "the rendered config)"
             )
+        field_name = info.field_name if info else "cookie field"
+        if field_name == "cookie_name":
+            import re as _re
+            if not _re.fullmatch(r"[A-Za-z0-9_.\-]+", v):
+                raise ValueError(
+                    "backend.cookie_name must contain only alphanumerics, "
+                    "'.', '_' or '-' (HAProxy tokenises the `cookie` "
+                    "directive by whitespace and treats ';' as an inline "
+                    "comment — anything else silently truncates the "
+                    "rendered persistence options). Got "
+                    f"{v!r}."
+                )
+        elif field_name == "cookie_options":
+            import re as _re
+            if not _re.fullmatch(r"[A-Za-z0-9_.=\- ]*", v):
+                raise ValueError(
+                    "backend.cookie_options must contain only "
+                    "alphanumerics, spaces, '=', '.', '_' or '-' "
+                    "(HAProxy parses `;` as an inline comment, and "
+                    "quoting / backslash metacharacters are not "
+                    f"part of the `cookie` keyword grammar). Got {v!r}."
+                )
         return v
 
     @field_validator("health_check_uri")

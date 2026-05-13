@@ -1015,12 +1015,56 @@ const FrontendManagement = () => {
       return;
     }
     if (grandfatheredContradictions.length > 0) {
+      // Bulgu #83 (round-23 audit) — surface the actual offending rule
+      // string(s) instead of just a count. Pre-fix the warning said
+      // "1 legacy rule has X !X" and the operator had to hunt
+      // through the ACL Builder cards to figure out which rule the
+      // gate was complaining about. The unchanged-rule path is the
+      // common case (operator changes port / maxconn on a frontend
+      // that already had a self-contradictory routing rule from a
+      // prior session), so making the rule discoverable from the
+      // toast keeps "Edit and Save" → "fix the dead rule" workflows
+      // single-screen. Also stop calling these rules "legacy" —
+      // the operator may have written them seconds earlier; the
+      // only thing this branch knows is that they weren't modified
+      // by the current edit.
+      const renderGrandfatheredRule = (r) => {
+        if (typeof r === 'string') return r;
+        if (r && typeof r === 'object') {
+          try { return JSON.stringify(r); } catch (_e) { return '[rule]'; }
+        }
+        return '[rule]';
+      };
+      const ruleSnippets = grandfatheredContradictions
+        .slice(0, 5)
+        .map(renderGrandfatheredRule)
+        .map((s) => (s.length > 160 ? `${s.slice(0, 157)}...` : s));
+      const extra = grandfatheredContradictions.length > ruleSnippets.length
+        ? ` (+${grandfatheredContradictions.length - ruleSnippets.length} more)`
+        : '';
       message.warning(
-        `This frontend has ${grandfatheredContradictions.length} legacy ` +
-        `routing/redirect rule(s) with a self-contradictory \`X !X\` ` +
-        `condition. The rule(s) never fire — fix them at your convenience. ` +
-        `Your current edit will still be saved.`,
-        6,
+        <div>
+          <div>
+            <strong>
+              {grandfatheredContradictions.length} routing/redirect rule(s)
+              you didn't modify in this edit contain a self-contradictory
+              `X !X` condition (e.g. `if acl1 !acl1`).
+            </strong>
+          </div>
+          <div style={{ marginTop: 4, fontSize: '12px' }}>
+            HAProxy accepts the syntax but `X AND NOT X` is always false,
+            so the rule never fires and traffic silently falls through to
+            `default_backend`. Your current edit will still be saved; fix
+            the rule(s) at your convenience.
+          </div>
+          <div style={{ marginTop: 6, fontSize: '12px', fontFamily: 'monospace' }}>
+            {ruleSnippets.map((s, i) => (
+              <div key={i}>• {s}</div>
+            ))}
+            {extra && <div>{extra}</div>}
+          </div>
+        </div>,
+        10,
       );
     }
 
@@ -1080,6 +1124,36 @@ const FrontendManagement = () => {
           );
         } else {
           message.success('Frontend updated successfully');
+        }
+
+        // Bulgu #83 (round-23 audit) — surface server-emitted
+        // grandfathered-rule warnings (e.g. `X !X` contradictions
+        // in routing/redirect rules that the operator did not
+        // touch this edit). The FE client-side gate ALSO catches
+        // these and fires its own toast above the modal close;
+        // we re-surface the server view here as a safety net in
+        // case the client gate missed an edge shape (different
+        // dict serialization, etc.). Server warnings already
+        // include the verbatim rule text, so the operator sees
+        // exactly which entry to fix.
+        const serverWarnings = Array.isArray(response.data?.warnings)
+          ? response.data.warnings
+          : [];
+        if (serverWarnings.length > 0 && grandfatheredContradictions.length === 0) {
+          message.warning(
+            <div>
+              <div><strong>Frontend saved, but the server flagged {serverWarnings.length} rule warning(s):</strong></div>
+              <div style={{ marginTop: 6, fontSize: '12px', fontFamily: 'monospace' }}>
+                {serverWarnings.slice(0, 5).map((w, i) => (
+                  <div key={i}>• {w.length > 240 ? `${w.slice(0, 237)}...` : w}</div>
+                ))}
+                {serverWarnings.length > 5 && (
+                  <div>(+{serverWarnings.length - 5} more)</div>
+                )}
+              </div>
+            </div>,
+            10,
+          );
         }
       } else {
         response = await axios.post('/api/frontends', requestData);

@@ -573,9 +573,18 @@ async def check_agents(conn, cluster_ids: List[int]) -> Dict[str, Any]:
             severity="warn",
             duration_ms=int((time.time() - started) * 1000),
         )
+    # Bulgu #84 (round-23 audit) — the canonical timestamp column on the
+    # `agents` table is `last_seen`. Pre-fix this query referenced a
+    # non-existent `a.last_heartbeat`, so every ACME preflight call
+    # (`POST /api/sites/preflight-acme`) crashed at the `check_agents`
+    # stage with `UndefinedColumnError: column a.last_heartbeat does
+    # not exist`, blocking the entire wizard's ACME pre-validation
+    # gate. Every other agents.last_seen reader in the codebase
+    # (routers/cluster.py:695-702, routers/agent.py, routers/dashboard
+    # *.py) uses `last_seen`; aligning here.
     rows = await conn.fetch(
         """
-        SELECT a.id, a.hostname, a.status, a.last_heartbeat, hc.id AS cluster_id, hc.name AS cluster_name
+        SELECT a.id, a.hostname, a.status, a.last_seen, hc.id AS cluster_id, hc.name AS cluster_name
         FROM agents a
         JOIN haproxy_clusters hc ON hc.pool_id = a.pool_id
         WHERE hc.id = ANY($1::int[])
