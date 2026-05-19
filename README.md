@@ -1065,6 +1065,115 @@ The IP Inventory page provides a unified view of all IP addresses across every c
 - **API Keys**: User API key generation and management
 - **Role Assignment**: Dynamic role assignment and permission updates
 
+#### Multi-Factor Authentication (MFA) — v1.6.0 (Issue #18)
+
+MFA is **optional per account** and **default OFF**. Existing users keep their
+single-factor (username/password) login unless they choose to enable it. The
+feature is fully additive: nothing changes for accounts that don't opt in.
+
+**For end-users**
+
+- Open **Users** → find your own row → click **Enable MFA**.
+- A wizard opens with three steps:
+  1. **Set up** — scan the QR code with Google Authenticator / Authy /
+     1Password / Microsoft Authenticator, or paste the displayed secret manually.
+  2. **Verify** — enter the current 6-digit code from your app.
+  3. **Backup codes** — save the 10 single-use recovery codes (format
+     `XXXX-YYYY`). They are shown only once. Use the **Copy all** /
+     **Download .txt** buttons.
+- After enrollment your sign-in becomes two-step: username/password →
+  6-digit TOTP (or a backup code).
+- To turn MFA off again, open your row's **Disable MFA** action and enter a
+  current TOTP or backup code.
+
+**For admins**
+
+- On any user with MFA enabled, the **Reset MFA** action wipes the user's
+  TOTP secret, backup codes, and pending challenges. A required *reason* is
+  written to the audit log. After reset the user logs in with their password
+  and may re-enroll.
+
+**Emergency: reset MFA for every user**
+
+Use the CLI helper when an authenticator outage / mass key loss happens.
+Double confirmation is required; the action is irreversible.
+
+```bash
+API_URL=https://hap.example.com ADMIN_TOKEN=eyJ... \
+  ./scripts/admin-mfa-reset-all.sh
+# Prompts ask for: 'yes' → 'RESET ALL MFA' → reason
+# Audit log:      action='mfa.disabled.admin_bulk_reset'
+```
+
+**Configuration**
+
+- Backend env var `MFA_ENCRYPTION_KEY` — a 44-char Fernet key used to encrypt
+  TOTP secrets at rest. Generate with:
+  ```bash
+  python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  ```
+  On Kubernetes the key lives in the `backend-secret` Secret
+  (`k8s/manifests/03-secrets.yaml`). The shipped manifest uses the placeholder
+  `mfa_encryption_key_replace_me`; replace it via your CI/CD pipeline (e.g.
+  `sed` step) before `kubectl apply`.
+- Optional `MFA_ACCOUNT_LABEL_DOMAIN` — overrides the per-user otpauth label
+  domain so QR codes show e.g. `alice@hap.example.com` instead of the request
+  hostname.
+
+**API endpoints (all additive)**
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/auth/login` | Returns `mfa_required:true`+`mfa_token` for MFA users; legacy shape otherwise |
+| `POST` | `/api/auth/login/mfa-verify` | Submits TOTP or backup code; returns JWT |
+| `GET`  | `/api/mfa/status` | Self status (enabled / method / backup codes remaining) |
+| `POST` | `/api/mfa/enroll/start` | Begin TOTP enrollment |
+| `POST` | `/api/mfa/enroll/confirm` | Confirm enrollment, returns 10 backup codes once |
+| `POST` | `/api/mfa/disable` | Self-disable (TOTP or backup required) |
+| `POST` | `/api/mfa/backup-codes/regenerate` | Issue 10 fresh backup codes (TOTP only) |
+| `GET`  | `/api/mfa/admin/status/{id}` | Admin: any user's MFA status |
+| `POST` | `/api/mfa/admin-reset/{id}` | Admin: reset a single user's MFA |
+| `POST` | `/api/mfa/admin-reset-all` | Admin: emergency reset for all users |
+
+**Rate limits (per-user, ingress-aware, operationally tunable)**
+
+MFA endpoints are rate-limited via slowapi+Redis with a **user-aware key
+function** (`backend/middleware/mfa_rate_limit_key.py`):
+
+1. If the request carries a valid Bearer JWT → bucket is `user:<id>`.
+   Each operator gets an isolated bucket; an org-wide MFA rollout is no
+   longer bottlenecked by the shared ingress IP.
+2. Else, if the TCP peer is in `MFA_TRUSTED_PROXY_CIDRS` → bucket is the
+   first `X-Forwarded-For` hop (real client IP behind the ingress).
+3. Else → bucket is the TCP peer (slowapi default).
+
+Defaults live in `backend/middleware/mfa_rate_limits.py` and are sized for
+**enterprise-scale** rollouts (thousands of operators). Each one is
+overridable via env var; an invalid string logs a `WARNING` and falls back
+to the default without crashing.
+
+| Endpoint | Env var | Default | Bucket |
+|---|---|---|---|
+| `POST /api/mfa/enroll/start` | `MFA_RATE_LIMIT_ENROLL_START` | `10/minute` | per user |
+| `POST /api/mfa/enroll/confirm` | `MFA_RATE_LIMIT_ENROLL_CONFIRM` | `10/minute` | per user |
+| `POST /api/mfa/disable` | `MFA_RATE_LIMIT_DISABLE` | `10/minute` | per user |
+| `POST /api/mfa/backup-codes/regenerate` | `MFA_RATE_LIMIT_REGENERATE_BACKUP_CODES` | `5/hour` | per user |
+| `POST /api/mfa/admin-reset/{id}` | `MFA_RATE_LIMIT_ADMIN_RESET` | `60/hour` | per admin |
+| `POST /api/mfa/admin-reset-all` | `MFA_RATE_LIMIT_ADMIN_RESET_ALL` | `1/day` | per admin |
+
+Limit string format follows slowapi: `<count>/<second|minute|hour|day>`.
+
+**Trusted-proxy configuration**
+`MFA_TRUSTED_PROXY_CIDRS` — comma-separated CIDR list, e.g.
+`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`. Empty (default) disables XFF
+parsing — XFF from any peer is then ignored, which is the safe choice when
+the topology is unknown. Set this when your backend sits behind a known
+ingress / load balancer so anonymous flows still get per-real-IP buckets.
+
+The pre-existing `/api/auth/login` rate-limiting policy is unchanged. On
+Kubernetes, see commented overrides in
+`k8s/manifests/07-configmaps.yaml::backend-config`.
+
 ### Settings - System Configuration
 - **Theme Settings**: Light/dark mode toggle and UI customization
 - **ACME / SSL Automation**: Configure ACME provider, directory URL, staging mode, auto-renewal, EAB credentials, and test CA connectivity
@@ -1524,12 +1633,25 @@ AGENT_CONFIG_SYNC_INTERVAL_SECONDS=30
 ```
 
 #### Frontend Configuration
-```bash
-# API Endpoint (auto-detected if empty)
-# Leave empty in production to use same-origin (window.location)
-REACT_APP_API_URL=""  # For development: "http://localhost:8000"
 
-# Environment
+The frontend is a Create-React-App single-page app served as a static bundle
+(`serve -s build`). It uses **same-origin** (`window.location.host`) for all
+`/api/*` calls — no env vars are needed in production. Routing is handled
+entirely by the nginx reverse proxy in front of the frontend pod (Kubernetes
+ingress + `nginx-config` ConfigMap, or `nginx/nginx.conf` for Docker Compose).
+
+> ⚠️ **Do NOT set `REACT_APP_API_URL` in your CI/CD pipeline.** CRA inlines
+> `REACT_APP_*` values into the bundle at **build time**, so any value baked
+> in there overrides the runtime same-origin detection and breaks every
+> deployment whose URL does not match the inlined string. Leave the variable
+> unset; the bundle will resolve to whatever host the user is browsing.
+
+```bash
+# Optional, only when you intentionally need a cross-origin API
+# (then CORS_ORIGINS on the backend must include the SPA's origin):
+# REACT_APP_API_URL="https://api.example.com"
+
+# Build settings
 NODE_ENV="production"
 GENERATE_SOURCEMAP="false"
 ```

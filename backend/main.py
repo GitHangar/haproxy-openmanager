@@ -8,7 +8,7 @@ import redis
 import asyncio
 from datetime import datetime, timedelta
 
-_version_info = {"version": "1.5.2", "releaseName": "ACME Diagnostics Panel Hardening", "releaseDate": "2026-05-13"}
+_version_info = {"version": "1.6.0", "releaseName": "Multi-Factor Authentication (MFA)", "releaseDate": "2026-05-18"}
 for _vpath in ["/app/version.json", os.path.join(os.path.dirname(__file__), "..", "version.json")]:
     try:
         with open(_vpath) as _vf:
@@ -40,6 +40,7 @@ from routers.settings import router as settings_router
 from routers.letsencrypt import router as letsencrypt_router
 from routers.acme_diagnostics import router as acme_diagnostics_router
 from routers.site_wizard import router as site_wizard_router
+from routers.mfa import router as mfa_router
 
 # Production logging configuration
 from utils.logging_config import setup_production_logging
@@ -820,6 +821,7 @@ app.include_router(config_router)  # Configuration management
 app.include_router(maintenance_router, prefix="/api", tags=["maintenance"])  # Database cleanup & maintenance
 app.include_router(auth_router)
 app.include_router(user_router)
+app.include_router(mfa_router)
 app.include_router(frontend_router)
 app.include_router(backend_router)
 app.include_router(cluster_router)

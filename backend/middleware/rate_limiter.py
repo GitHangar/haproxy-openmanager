@@ -2,6 +2,7 @@
 Rate Limiting Middleware for Production Security
 Protects API endpoints from abuse and DDoS attacks
 """
+import os
 import time
 import logging
 from typing import Callable
@@ -16,10 +17,15 @@ from database.connection import redis_client
 
 logger = logging.getLogger(__name__)
 
-# Rate limiter instance using Redis backend  
+# Resolve the Redis storage URI from REDIS_URL (set by docker-compose / k8s
+# ConfigMap). Falls back to the compose service hostname for backward
+# compatibility when REDIS_URL is unset.
+_REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379").rstrip("/")
+_LIMITER_STORAGE_URI = f"{_REDIS_URL}/0" if "/" not in _REDIS_URL.split("//", 1)[-1] else _REDIS_URL
+
 limiter = Limiter(
     key_func=get_remote_address,
-    storage_uri="redis://redis:6379/0",
+    storage_uri=_LIMITER_STORAGE_URI,
     default_limits=["1000/hour"],  # Default global limit
     retry_after=lambda name, t: int(t) + 10
 )

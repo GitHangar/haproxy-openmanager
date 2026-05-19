@@ -71,15 +71,17 @@ services:
 
   # Frontend React App - pulls from Docker Hub by default
   # To build locally instead, uncomment the build section and run: docker compose build frontend
+  #
+  # NOTE: REACT_APP_* env vars are BUILD-time only for Create-React-App. The
+  # runtime container (serve -s build) does NOT consume them. The frontend
+  # uses same-origin (window.location) for /api/* and is routed by the nginx
+  # service below to the backend container. No env vars are required here.
   frontend:
     image: taylanbakircioglu/haproxy-openmanager-frontend:latest
     # build:
     #   context: ./frontend
     #   dockerfile: Dockerfile
     container_name: haproxy-openmanager-frontend
-    environment:
-      - REACT_APP_API_URL=
-      - NODE_ENV=production
     expose:
       - "3000"
     depends_on:

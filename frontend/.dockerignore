@@ -1,0 +1,34 @@
+# Build artifacts (regenerated inside the multi-stage builder)
+build
+node_modules
+coverage
+
+# Local dev-only overrides — MUST be excluded so the host's
+# `.env.local` (e.g. REACT_APP_API_URL=http://localhost:8000) does NOT
+# bleed into a production bundle via build-time inline-replace.
+.env
+.env.local
+.env.*.local
+.env.development
+.env.development.local
+.env.test
+.env.test.local
+
+# VCS / IDE / OS noise
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+*.log
+
+# Tests
+**/__tests__
+**/*.test.js
+**/*.test.jsx
+**/*.test.ts
+**/*.test.tsx
+
+# Misc
+README.md
+.eslintcache

@@ -126,10 +126,26 @@ class GlobalExceptionHandler:
             except Exception as body_error:
                 logger.debug(f"Could not extract raw body for debugging: {body_error}")
         
-        # Enhanced log message for agent heartbeats
-        log_message = f"Validation error: {str(exc)}"
+        # Build a sanitized log summary. The raw `str(exc)` from Pydantic
+        # contains the user-supplied `input` value for each failed field —
+        # which leaks secrets like TOTP codes, backup codes, mfa_token, and
+        # passwords to plaintext logs. Use only field NAMES + types here;
+        # `validation_details` (already sanitized to {field, message, type})
+        # is attached separately for downstream structured logging.
+        _field_names = [
+            err.get("field", "unknown")
+            for err in error_details.get("validation_errors", [])
+        ]
+        _err_count = len(error_details.get("validation_errors", []))
+        log_message = (
+            f"Validation error: {_err_count} field(s) failed validation: "
+            f"[{', '.join(_field_names)}]"
+        )
         if agent_name != "unknown":
-            log_message = f"Agent '{agent_name}' heartbeat validation error: {str(exc)}"
+            log_message = (
+                f"Agent '{agent_name}' heartbeat validation error: "
+                f"{_err_count} field(s) failed: [{', '.join(_field_names)}]"
+            )
         
         # Log validation error with enhanced details
         log_with_correlation(

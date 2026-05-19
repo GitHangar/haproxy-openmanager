@@ -9,13 +9,47 @@ from datetime import datetime, timedelta
 # Import database and models
 from database.connection import get_database_connection, close_database_connection
 from models.user import LoginRequest, User, UserCreate, UserUpdate, UserPasswordUpdate
+from models.mfa import MfaVerifyRequest
 from utils.activity_log import log_user_activity
 from auth_middleware import get_current_user_from_token
+from services import mfa_service
 
 # Rate limiting temporarily disabled
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 logger = logging.getLogger(__name__)
+
+MFA_PENDING_TTL_SECONDS = 300  # 5 minutes — pre-verification challenge lifetime
+MFA_PENDING_MAX_ATTEMPTS = 5  # invalidate token after this many wrong codes
+
+
+async def _fetch_mfa_state(conn, user_id: int):
+    """Return (mfa_enabled, mfa_secret_encrypted, mfa_last_used_totp_step) or None
+    when the MFA columns aren't yet present (pre-migration deploys).
+    """
+    try:
+        return await conn.fetchrow(
+            """
+            SELECT mfa_enabled, mfa_secret_encrypted, mfa_last_used_totp_step
+              FROM users
+             WHERE id = $1
+            """,
+            user_id,
+        )
+    except Exception as exc:
+        logger.warning(f"MFA columns not available (assuming disabled): {exc}")
+        return None
+
+
+async def _cleanup_expired_pending_logins(conn, user_id: int) -> None:
+    """Lazy cleanup of expired pending MFA challenges for this user."""
+    try:
+        await conn.execute(
+            "DELETE FROM mfa_pending_logins WHERE user_id = $1 AND expires_at < NOW()",
+            user_id,
+        )
+    except Exception as exc:
+        logger.debug(f"Pending-login cleanup skipped: {exc}")
 
 # Security scheme
 security = HTTPBearer()
@@ -96,7 +130,7 @@ async def login(login_request: LoginRequest, request: Request):
                 SELECT id, username, email, password_hash, is_active, role, 
                        created_at, updated_at, last_login_at
                 FROM users 
-                WHERE username = $1
+                WHERE username = $1 AND is_active = TRUE
             """, login_request.username)
         except Exception as schema_error:
             logger.warning(f"Schema error, trying fallback query: {schema_error}")
@@ -106,7 +140,7 @@ async def login(login_request: LoginRequest, request: Request):
                     SELECT id, username, email, password_hash, is_active,
                            created_at, updated_at, last_login_at
                     FROM users 
-                    WHERE username = $1
+                    WHERE username = $1 AND is_active = TRUE
                 """, login_request.username)
             except Exception as column_error:
                 logger.warning(f"last_login_at column error, trying last_login: {column_error}")
@@ -115,26 +149,67 @@ async def login(login_request: LoginRequest, request: Request):
                     SELECT id, username, email, password_hash, is_active,
                            created_at, updated_at, last_login
                     FROM users 
-                    WHERE username = $1
+                    WHERE username = $1 AND is_active = TRUE
                 """, login_request.username)
         
         if not user:
+            # Covers both "no such user" and "soft-deleted (is_active=FALSE)".
+            # We deliberately return the same generic 401 in either case to
+            # avoid leaking whether an account exists (account enumeration
+            # prevention). Soft-deleted rows are filtered out by the
+            # `AND is_active = TRUE` predicate above.
             await close_database_connection(conn)
             logger.warning(f"Failed login attempt for username: {login_request.username}")
             raise HTTPException(status_code=401, detail="Invalid username or password")
-        
-        if not user['is_active']:
-            await close_database_connection(conn)
-            logger.warning(f"Login attempt for inactive account: {login_request.username}")
-            raise HTTPException(status_code=401, detail="Account is deactivated")
-        
+
         # Verify password
         import bcrypt
         if not bcrypt.checkpw(login_request.password.encode('utf-8'), user['password_hash'].encode('utf-8')):
             await close_database_connection(conn)
             logger.warning(f"Wrong password for user: {login_request.username}")
             raise HTTPException(status_code=401, detail="Invalid username or password")
-        
+
+        # Issue #18 — MFA branch (v1.6.0): if the user opted in, defer JWT mint and
+        # last_login update until /api/auth/login/mfa-verify completes.
+        mfa_state = await _fetch_mfa_state(conn, user['id'])
+        if mfa_state and mfa_state.get('mfa_enabled'):
+            await _cleanup_expired_pending_logins(conn, user['id'])
+            challenge_token = mfa_service.generate_challenge_token()
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO mfa_pending_logins (user_id, challenge_token, expires_at, ip_address)
+                    VALUES ($1, $2, NOW() + ($3 || ' seconds')::interval, $4)
+                    """,
+                    user['id'],
+                    challenge_token,
+                    str(MFA_PENDING_TTL_SECONDS),
+                    str(request.client.host) if request.client else None,
+                )
+            except Exception as exc:
+                await close_database_connection(conn)
+                logger.error(f"Failed to create MFA pending login: {exc}")
+                raise HTTPException(status_code=500, detail="MFA challenge creation failed")
+
+            await close_database_connection(conn)
+
+            await log_user_activity(
+                user_id=user['id'],
+                action='mfa.login.challenge_issued',
+                resource_type='mfa',
+                resource_id=str(user['id']),
+                details={'login_method': 'username_password'},
+                ip_address=str(request.client.host) if request.client else None,
+                user_agent=request.headers.get('user-agent'),
+            )
+
+            return {
+                "mfa_required": True,
+                "mfa_token": challenge_token,
+                "methods": ["totp", "backup"],
+                "expires_in": MFA_PENDING_TTL_SECONDS,
+            }
+
         # Update last login (try different column names)
         try:
             await conn.execute("""
@@ -241,6 +316,348 @@ async def login(login_request: LoginRequest, request: Request):
     except Exception as e:
         logger.error(f"Login error: {e}")
         raise HTTPException(status_code=500, detail="Login failed")
+
+@router.post(
+    "/login/mfa-verify",
+    summary="MFA Verification (Step 2 of Login)",
+    response_description="JWT access token after successful TOTP/backup verification",
+)
+async def login_mfa_verify(payload: MfaVerifyRequest, request: Request):
+    """
+    # MFA Verification — Step 2 of the two-step login flow
+
+    Submit a 6-digit TOTP code OR an 8-character backup code (with optional dash)
+    together with the ``mfa_token`` returned by ``POST /api/auth/login`` for an
+    MFA-enabled account. On success, returns the same response shape as a
+    non-MFA login (Branch A).
+
+    ## Request Body
+    - **mfa_token**: 64-char challenge token from /login response
+    - **code**: 6 digits (TOTP) or `XXXX-YYYY` (backup)
+
+    ## Error Responses
+    - **401**: Invalid code (attempts counter increments)
+    - **410**: Challenge expired or invalidated (too many wrong attempts)
+    """
+    ip_address = str(request.client.host) if request.client else None
+    user_agent = request.headers.get('user-agent')
+
+    # Outcome captured from the transactional block so we can do JWT mint /
+    # activity logging AFTER commit (no side effects on rollback).
+    success_payload: Optional[dict] = None
+    failure: Optional[dict] = None  # { user_id, attempts, invalidated, reason, http_status, detail }
+
+    conn = None
+    try:
+        conn = await get_database_connection()
+
+        # Round 1 audit fix — wrap the whole verify+update in a single
+        # transaction with row-level locks (FOR UPDATE) so two concurrent
+        # /mfa-verify calls cannot both consume the same TOTP step or the
+        # same pending challenge. We never raise inside the transaction once
+        # we've started mutating the pending row (would rollback the mark);
+        # instead we capture `failure` and raise after commit.
+        async with conn.transaction():
+            pending = await conn.fetchrow(
+                """
+                SELECT id, user_id, attempts, expires_at, used_at
+                  FROM mfa_pending_logins
+                 WHERE challenge_token = $1
+                 FOR UPDATE
+                """,
+                payload.mfa_token,
+            )
+
+            if not pending:
+                failure = {
+                    'user_id': None,
+                    'attempts': 0,
+                    'invalidated': True,
+                    'reason': 'challenge_not_found',
+                    'http_status': 410,
+                    'detail': 'MFA challenge not found or expired',
+                }
+            elif pending['used_at'] is not None:
+                failure = {
+                    'user_id': pending['user_id'],
+                    'attempts': pending['attempts'],
+                    'invalidated': True,
+                    'reason': 'challenge_already_used',
+                    'http_status': 410,
+                    'detail': 'MFA challenge already used',
+                }
+            elif pending['expires_at'] and pending['expires_at'] < datetime.utcnow():
+                failure = {
+                    'user_id': pending['user_id'],
+                    'attempts': pending['attempts'],
+                    'invalidated': True,
+                    'reason': 'challenge_expired',
+                    'http_status': 410,
+                    'detail': 'MFA challenge expired',
+                }
+            elif pending['attempts'] >= MFA_PENDING_MAX_ATTEMPTS:
+                await conn.execute(
+                    "UPDATE mfa_pending_logins SET used_at = NOW() WHERE id = $1",
+                    pending['id'],
+                )
+                failure = {
+                    'user_id': pending['user_id'],
+                    'attempts': pending['attempts'],
+                    'invalidated': True,
+                    'reason': 'too_many_attempts_pre_check',
+                    'http_status': 410,
+                    'detail': 'MFA challenge invalidated (too many attempts)',
+                }
+
+            if failure is None:
+                # Lock the user row so the atomic TOTP-step bump cannot race a
+                # parallel verify on a different pending challenge for the
+                # same account.
+                user_row = await conn.fetchrow(
+                    """
+                    SELECT id, username, email, role, is_active,
+                           created_at, updated_at, last_login_at,
+                           mfa_secret_encrypted, mfa_last_used_totp_step
+                      FROM users
+                     WHERE id = $1
+                     FOR UPDATE
+                    """,
+                    pending['user_id'],
+                )
+                if not user_row or not user_row['is_active']:
+                    failure = {
+                        'user_id': pending['user_id'],
+                        'attempts': pending['attempts'],
+                        'invalidated': False,
+                        'reason': 'user_unavailable',
+                        'http_status': 401,
+                        'detail': 'User not available',
+                    }
+                elif not user_row['mfa_secret_encrypted']:
+                    failure = {
+                        'user_id': user_row['id'],
+                        'attempts': pending['attempts'],
+                        'invalidated': True,
+                        'reason': 'mfa_not_configured',
+                        'http_status': 410,
+                        'detail': 'MFA not configured for this user',
+                    }
+                else:
+                    secret_plain = mfa_service.decrypt_secret(user_row['mfa_secret_encrypted'])
+                    verified_method: Optional[str] = None
+                    codes_remaining: Optional[int] = None
+
+                    if secret_plain:
+                        ok, step = mfa_service.verify_totp_with_replay_guard(
+                            secret_plain, payload.code, user_row['mfa_last_used_totp_step']
+                        )
+                        if ok:
+                            # Atomic step bump — refuse if another request already
+                            # consumed this (or a newer) TOTP step.
+                            bumped = await conn.fetchval(
+                                """
+                                UPDATE users
+                                   SET mfa_last_used_totp_step = $1,
+                                       mfa_last_used_at = NOW()
+                                 WHERE id = $2
+                                   AND (mfa_last_used_totp_step IS NULL
+                                        OR mfa_last_used_totp_step < $1)
+                                 RETURNING id
+                                """,
+                                step,
+                                user_row['id'],
+                            )
+                            if bumped:
+                                verified_method = 'totp'
+
+                    if verified_method is None:
+                        # Backup codes — atomic single-use consumption.
+                        rows = await conn.fetch(
+                            """
+                            SELECT id, code_hash FROM mfa_backup_codes
+                             WHERE user_id = $1 AND used_at IS NULL
+                            """,
+                            user_row['id'],
+                        )
+                        for row in rows:
+                            if await mfa_service.check_backup_code(payload.code, row['code_hash']):
+                                consumed_id = await conn.fetchval(
+                                    """
+                                    UPDATE mfa_backup_codes
+                                       SET used_at = NOW()
+                                     WHERE id = $1 AND used_at IS NULL
+                                     RETURNING id
+                                    """,
+                                    row['id'],
+                                )
+                                if consumed_id:
+                                    verified_method = 'backup'
+                                    codes_remaining = await conn.fetchval(
+                                        "SELECT COUNT(*) FROM mfa_backup_codes WHERE user_id = $1 AND used_at IS NULL",
+                                        user_row['id'],
+                                    )
+                                break
+
+                    if verified_method is None:
+                        new_attempts = pending['attempts'] + 1
+                        invalidated = new_attempts >= MFA_PENDING_MAX_ATTEMPTS
+                        await conn.execute(
+                            """
+                            UPDATE mfa_pending_logins
+                               SET attempts = $1,
+                                   used_at = CASE WHEN $2 THEN NOW() ELSE used_at END
+                             WHERE id = $3
+                            """,
+                            new_attempts,
+                            invalidated,
+                            pending['id'],
+                        )
+                        failure = {
+                            'user_id': user_row['id'],
+                            'attempts': new_attempts,
+                            'invalidated': invalidated,
+                            'reason': 'invalid_code',
+                            'http_status': 410 if invalidated else 401,
+                            'detail': 'MFA challenge invalidated (too many attempts)'
+                            if invalidated else 'Invalid MFA code',
+                        }
+                    else:
+                        # Verified — finalize state inside the transaction so a
+                        # concurrent verify sees used_at on retry.
+                        await conn.execute(
+                            "UPDATE mfa_pending_logins SET used_at = NOW() WHERE id = $1",
+                            pending['id'],
+                        )
+                        if verified_method != 'totp':
+                            await conn.execute(
+                                "UPDATE users SET mfa_last_used_at = NOW() WHERE id = $1",
+                                user_row['id'],
+                            )
+                        try:
+                            await conn.execute(
+                                "UPDATE users SET last_login_at = CURRENT_TIMESTAMP WHERE id = $1",
+                                user_row['id'],
+                            )
+                        except Exception as exc:
+                            logger.warning(f"last_login_at update failed (continuing): {exc}")
+
+                        user_roles = await conn.fetch(
+                            """
+                            SELECT r.id, r.name, r.display_name, r.permissions
+                              FROM user_roles ur
+                              JOIN roles r ON ur.role_id = r.id
+                             WHERE ur.user_id = $1 AND ur.is_active = TRUE AND r.is_active = TRUE
+                            """,
+                            user_row['id'],
+                        )
+
+                        permissions: dict = {}
+                        roles_list: list = []
+                        for role_row in user_roles:
+                            roles_list.append({
+                                'id': role_row['id'],
+                                'name': role_row['name'],
+                                'display_name': role_row['display_name'],
+                            })
+                            role_permissions = role_row['permissions']
+                            if isinstance(role_permissions, str):
+                                import json
+                                role_permissions = json.loads(role_permissions)
+                            if role_permissions:
+                                for perm in role_permissions:
+                                    if '.' in perm:
+                                        resource, action = perm.split('.', 1)
+                                        if resource not in permissions:
+                                            permissions[resource] = {}
+                                        permissions[resource][action] = True
+
+                        success_payload = {
+                            'user': dict(user_row),
+                            'roles_list': roles_list,
+                            'permissions': permissions,
+                            'method': verified_method,
+                            'codes_remaining': codes_remaining,
+                        }
+
+        # ------------------------------------------------------------------
+        # Transaction has committed. Side-effects (JWT mint, audit log) below.
+        # ------------------------------------------------------------------
+        await close_database_connection(conn)
+        conn = None
+
+        if failure is not None:
+            if failure['user_id'] is not None:
+                await log_user_activity(
+                    user_id=failure['user_id'],
+                    action='mfa.login.failed',
+                    resource_type='mfa',
+                    resource_id=str(failure['user_id']),
+                    details={
+                        'reason': failure['reason'],
+                        'attempts': failure['attempts'],
+                        'invalidated': failure['invalidated'],
+                    },
+                    ip_address=ip_address,
+                    user_agent=user_agent,
+                )
+            raise HTTPException(status_code=failure['http_status'], detail=failure['detail'])
+
+        # Success path
+        assert success_payload is not None  # for type checkers; transaction guarantees this
+        user_row = success_payload['user']
+
+        from jose import jwt
+        from config import JWT_SECRET_KEY, JWT_ALGORITHM
+
+        token_payload = {
+            "user_id": user_row['id'],
+            "username": user_row['username'],
+            "email": user_row['email'],
+            "role": user_row['role'] if 'role' in user_row.keys() else 'admin',
+            "exp": datetime.utcnow() + timedelta(hours=24),
+        }
+        token = jwt.encode(token_payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+        await log_user_activity(
+            user_id=user_row['id'],
+            action='mfa.login.success',
+            resource_type='mfa',
+            resource_id=str(user_row['id']),
+            details={
+                'method': success_payload['method'],
+                'codes_remaining': success_payload['codes_remaining']
+                if success_payload['method'] == 'backup' else None,
+            },
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_in": 86400,
+            "user": {
+                "id": user_row['id'],
+                "username": user_row['username'],
+                "email": user_row['email'],
+                "role": user_row['role'] if 'role' in user_row.keys() else 'admin',
+                "is_active": user_row['is_active'],
+                "created_at": user_row['created_at'].isoformat() if user_row.get('created_at') else None,
+                "last_login_at": datetime.utcnow().isoformat(),
+            },
+            "roles": success_payload['roles_list'],
+            "permissions": success_payload['permissions'],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"MFA verify error: {exc}")
+        raise HTTPException(status_code=500, detail="MFA verification failed")
+    finally:
+        if conn is not None:
+            await close_database_connection(conn)
+
 
 @router.post("/logout", summary="User Logout", response_description="Logout confirmation")
 async def logout(request: Request, authorization: str = Header(None)):

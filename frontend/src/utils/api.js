@@ -1,32 +1,28 @@
 /**
  * API Configuration
- * Centralized API URL management for the application
- * 
- * Environment Variables:
- * - REACT_APP_API_URL: Full API URL (e.g., https://api.example.com)
- * - NODE_ENV: Environment (development, production)
+ * Centralized API URL management for the application.
+ *
+ * Resolution strategy (same in dev and prod — keeps SPA same-origin):
+ *   1) REACT_APP_API_URL — explicit override at BUILD time. Use only when
+ *      the SPA must call a cross-origin API (CORS must be enabled there).
+ *   2) window.location.{protocol,host} — same-origin. In dev this routes
+ *      through CRA dev-server proxy (see frontend/src/setupProxy.js); in
+ *      prod through nginx ingress (`/api/*` → backend service).
+ *   3) Empty string — non-browser env (SSR/tests). Yields relative URLs.
+ *
+ * NOTE: Do NOT hardcode `http://localhost:8000` here. Even in unreachable
+ * branches CRA/Terser keeps string literals in the bundle, which would
+ * confuse anyone auditing the production artifact.
  */
-
-// Get API URL from environment or use default based on environment
 const getApiUrl = () => {
-  // Priority 1: Explicit environment variable
   if (process.env.REACT_APP_API_URL) {
     return process.env.REACT_APP_API_URL;
   }
-  
-  // Priority 2: Detect from window location (for production deployments)
-  // Use window.location.host (includes port) instead of hostname (excludes port)
-  // so non-standard ports like :8080 are preserved, preventing CORS issues
   if (typeof window !== 'undefined' && window.location) {
     const { protocol, host } = window.location;
-    
-    if (process.env.NODE_ENV === 'production') {
-      return `${protocol}//${host}`;
-    }
+    return `${protocol}//${host}`;
   }
-  
-  // Priority 3: Development default
-  return 'http://localhost:8000';
+  return '';
 };
 
 // API Base URL

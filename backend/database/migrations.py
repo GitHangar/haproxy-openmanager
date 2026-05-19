@@ -1700,7 +1700,86 @@ async def run_all_migrations():
     # (cluster_id, bind_address, bind_port) WHERE is_active.
     await ensure_frontends_bind_unique_constraint()
 
+    # Issue #18 — TOTP MFA (v1.6.0): additive columns + 3 new tables
+    await ensure_mfa_columns()
+
     logger.info("Database migrations completed successfully.")
+
+
+async def ensure_mfa_columns():
+    """Issue #18 — TOTP MFA (v1.6.0): additive columns on users + 3 new tables.
+
+    All operations are idempotent (ADD COLUMN IF NOT EXISTS, CREATE TABLE IF NOT EXISTS).
+    Default behavior preserved: every existing user gets mfa_enabled=FALSE, so login
+    flow is byte-identical for accounts that don't opt in.
+    """
+    conn = None
+    try:
+        conn = await get_database_connection()
+
+        await conn.execute("""
+            ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN DEFAULT FALSE NOT NULL,
+                ADD COLUMN IF NOT EXISTS mfa_method VARCHAR(20),
+                ADD COLUMN IF NOT EXISTS mfa_secret_encrypted TEXT,
+                ADD COLUMN IF NOT EXISTS mfa_enrolled_at TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS mfa_last_used_at TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS mfa_last_used_totp_step BIGINT;
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS mfa_backup_codes (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                code_hash VARCHAR(255) NOT NULL,
+                used_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_mfa_backup_codes_user
+              ON mfa_backup_codes(user_id);
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS mfa_pending_logins (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                challenge_token VARCHAR(64) UNIQUE NOT NULL,
+                attempts INTEGER DEFAULT 0 NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                used_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ip_address INET
+            );
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mfa_pending_token ON mfa_pending_logins(challenge_token);"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mfa_pending_expires ON mfa_pending_logins(expires_at);"
+        )
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS mfa_pending_enrollments (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                secret_encrypted TEXT NOT NULL,
+                attempts INTEGER DEFAULT 0 NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mfa_pending_enroll_expires ON mfa_pending_enrollments(expires_at);"
+        )
+
+        logger.info("✅ MFA migration completed (Issue #18 — Phase 1)")
+    except Exception as e:
+        logger.error(f"Failed to ensure MFA columns: {e}")
+        # Don't raise — follow the same defensive pattern as ensure_user_activity_logs_table
+    finally:
+        if conn:
+            await close_database_connection(conn)
 
 async def add_ssl_certificate_id_to_backend_servers():
     """Add ssl_certificate_id column to backend_servers table for SSL certificate management"""

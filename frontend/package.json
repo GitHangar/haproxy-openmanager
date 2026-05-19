@@ -1,6 +1,6 @@
 {
   "name": "haproxy-openmanager-frontend",
-  "version": "1.5.2",
+  "version": "1.6.0",
   "description": "HAProxy Load Balancer Management UI",
   "license": "AGPL-3.0-or-later",
   "dependencies": {
@@ -17,7 +17,8 @@
     "@monaco-editor/react": "^4.6.0",
     "react-ace": "^10.1.0",
     "ace-builds": "^1.23.4",
-    "react-window": "^1.8.10"
+    "react-window": "^1.8.10",
+    "qrcode.react": "^4.0.0"
   },
   "devDependencies": {
     "@types/react": "^18.0.0",

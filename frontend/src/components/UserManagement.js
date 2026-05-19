@@ -32,11 +32,15 @@ import {
   HistoryOutlined,
   UserAddOutlined,
   KeyOutlined,
-  DownloadOutlined
+  DownloadOutlined,
+  SafetyCertificateOutlined,
+  ReloadOutlined,
+  InfoCircleOutlined,
 } from '@ant-design/icons';
 import axios from 'axios';
 import { useAuth } from '../contexts/AuthContext';
 import { extractApiError } from '../utils/apiError';
+import MFAEnrollModal from './MFAEnrollModal';
 
 const { TabPane } = Tabs;
 const { Option } = Select;
@@ -225,8 +229,16 @@ const PERMISSION_TREE = [
 ];
 
 const UserManagement = () => {
-  const { isAdmin } = useAuth(); // Get admin status from auth context
+  const { isAdmin, user: currentUser } = useAuth(); // Get admin status from auth context
   const { token } = theme.useToken();
+
+  // MFA UI state (Issue #18, v1.6.0)
+  const [mfaEnrollOpen, setMfaEnrollOpen] = useState(false);
+  const [mfaDisableOpen, setMfaDisableOpen] = useState(false);
+  const [mfaDisableForm] = Form.useForm();
+  const [mfaActionLoading, setMfaActionLoading] = useState(false);
+  const [mfaResetTarget, setMfaResetTarget] = useState(null);
+  const [mfaResetForm] = Form.useForm();
   const [activeTab, setActiveTab] = useState('users');
   
   // Users state
@@ -525,6 +537,47 @@ const UserManagement = () => {
     }
   };
 
+  // ---- MFA handlers (Issue #18, v1.6.0) -----------------------------------
+
+  const handleMfaEnrolled = () => {
+    setMfaEnrollOpen(false);
+    message.success('MFA enabled for your account.');
+    fetchUsers();
+  };
+
+  const handleMfaDisableSubmit = async (values) => {
+    setMfaActionLoading(true);
+    try {
+      await axios.post('/api/mfa/disable', { code: (values.code || '').trim() });
+      message.success('MFA disabled for your account.');
+      setMfaDisableOpen(false);
+      mfaDisableForm.resetFields();
+      fetchUsers();
+    } catch (error) {
+      message.error(extractApiError(error, 'Failed to disable MFA'));
+    } finally {
+      setMfaActionLoading(false);
+    }
+  };
+
+  const handleMfaAdminResetSubmit = async (values) => {
+    if (!mfaResetTarget) return;
+    setMfaActionLoading(true);
+    try {
+      await axios.post(`/api/mfa/admin-reset/${mfaResetTarget.id}`, {
+        reason: (values.reason || '').trim(),
+      });
+      message.success(`MFA reset for user '${mfaResetTarget.username}'.`);
+      setMfaResetTarget(null);
+      mfaResetForm.resetFields();
+      fetchUsers();
+    } catch (error) {
+      message.error(extractApiError(error, 'Failed to reset MFA'));
+    } finally {
+      setMfaActionLoading(false);
+    }
+  };
+
   const handleChangePassword = (user) => {
     setSelectedUser(user);
     passwordForm.resetFields();
@@ -718,6 +771,15 @@ const UserManagement = () => {
       )
     },
     {
+      title: 'MFA',
+      dataIndex: 'mfa_enabled',
+      key: 'mfa_enabled',
+      width: 90,
+      render: (enabled) => enabled
+        ? <Tag icon={<SafetyCertificateOutlined />} color="green">ON</Tag>
+        : <Tag color="default">OFF</Tag>
+    },
+    {
       title: 'Last Login',
       dataIndex: 'last_login_at',
       key: 'last_login_at',
@@ -726,31 +788,94 @@ const UserManagement = () => {
     {
       title: 'Actions',
       key: 'actions',
-      render: (_, record) => (
-        <Space>
-          {isAdmin() && (
-            <>
-              <Tooltip title="Edit User">
-                <Button 
-                  icon={<EditOutlined />} 
-                  size="small" 
-                  onClick={() => handleEditUser(record)}
+      render: (_, record) => {
+        const isSelf = currentUser && record.id === currentUser.id;
+        return (
+          <Space>
+            {isAdmin() && (
+              <>
+                <Tooltip title="Edit User">
+                  <Button
+                    icon={<EditOutlined />}
+                    size="small"
+                    onClick={() => handleEditUser(record)}
+                  />
+                </Tooltip>
+                <Tooltip title="Assign Roles">
+                  <Button
+                    icon={<TeamOutlined />}
+                    size="small"
+                    onClick={() => handleAssignRoles(record)}
+                  />
+                </Tooltip>
+                <Tooltip title="Change Password">
+                  <Button
+                    icon={<KeyOutlined />}
+                    size="small"
+                    onClick={() => handleChangePassword(record)}
+                  />
+                </Tooltip>
+              </>
+            )}
+            {isSelf && !record.mfa_enabled && (
+              <Tooltip title="Enable MFA for your account">
+                <Button
+                  icon={<SafetyCertificateOutlined />}
+                  size="small"
+                  type="primary"
+                  ghost
+                  onClick={() => setMfaEnrollOpen(true)}
+                >
+                  Enable MFA
+                </Button>
+              </Tooltip>
+            )}
+            {isSelf && record.mfa_enabled && (
+              <Tooltip title="Disable MFA for your account">
+                <Button
+                  icon={<SafetyCertificateOutlined />}
+                  size="small"
+                  onClick={() => {
+                    mfaDisableForm.resetFields();
+                    setMfaDisableOpen(true);
+                  }}
+                >
+                  Disable MFA
+                </Button>
+              </Tooltip>
+            )}
+            {isAdmin() && !isSelf && record.mfa_enabled && (
+              <Tooltip title="Reset this user's MFA (admin only)">
+                <Button
+                  icon={<ReloadOutlined />}
+                  size="small"
+                  danger
+                  onClick={() => {
+                    mfaResetForm.resetFields();
+                    setMfaResetTarget(record);
+                  }}
                 />
               </Tooltip>
-              <Tooltip title="Assign Roles">
-                <Button 
-                  icon={<TeamOutlined />} 
-                  size="small" 
-                  onClick={() => handleAssignRoles(record)}
+            )}
+            {isAdmin() && !isSelf && !record.mfa_enabled && (
+              <Tooltip
+                title={
+                  <span>
+                    Only this user can enable their own MFA — the TOTP secret
+                    must be set up from their device. Ask them to sign in and
+                    click <b>Enable MFA</b> in their own row.
+                  </span>
+                }
+              >
+                <Button
+                  icon={<InfoCircleOutlined />}
+                  size="small"
+                  type="text"
+                  style={{ color: '#8c8c8c' }}
                 />
               </Tooltip>
-              <Tooltip title="Change Password">
-                <Button 
-                  icon={<KeyOutlined />} 
-                  size="small" 
-                  onClick={() => handleChangePassword(record)}
-                />
-              </Tooltip>
+            )}
+            {isAdmin() && (
               <Popconfirm
                 title="Are you sure you want to delete this user?"
                 onConfirm={() => handleDeleteUser(record)}
@@ -758,20 +883,18 @@ const UserManagement = () => {
                 cancelText="No"
               >
                 <Tooltip title="Delete User">
-                  <Button 
-                    icon={<DeleteOutlined />} 
-                    danger 
+                  <Button
+                    icon={<DeleteOutlined />}
+                    danger
                     size="small"
                   />
                 </Tooltip>
               </Popconfirm>
-            </>
-          )}
-          {!isAdmin() && (
-            <Text type="secondary">View Only</Text>
-          )}
-        </Space>
-      )
+            )}
+            {!isAdmin() && !isSelf && <Text type="secondary">View Only</Text>}
+          </Space>
+        );
+      }
     }
   ];
 
@@ -1507,6 +1630,93 @@ const UserManagement = () => {
               </Button>
               <Button onClick={() => setRoleAssignmentModalVisible(false)}>
                 Cancel
+              </Button>
+            </Space>
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* MFA enrollment wizard (self) */}
+      <MFAEnrollModal
+        open={mfaEnrollOpen}
+        onClose={() => setMfaEnrollOpen(false)}
+        onEnrolled={handleMfaEnrolled}
+      />
+
+      {/* MFA self-disable modal */}
+      <Modal
+        title="Disable Multi-Factor Authentication"
+        open={mfaDisableOpen}
+        onCancel={() => setMfaDisableOpen(false)}
+        footer={null}
+        destroyOnClose
+      >
+        <Form form={mfaDisableForm} layout="vertical" onFinish={handleMfaDisableSubmit}>
+          <p>
+            Enter a current code from your authenticator app, or one of your backup
+            codes (format: <code>XXXX-YYYY</code>), to disable MFA.
+          </p>
+          <Form.Item
+            name="code"
+            label="MFA code"
+            rules={[
+              { required: true, message: 'Please enter your MFA code.' },
+              { min: 6, message: 'Code is too short.' },
+              { max: 10, message: 'Code is too long.' },
+            ]}
+          >
+            <Input
+              placeholder="123456 or XXXX-YYYY"
+              autoComplete="one-time-code"
+              maxLength={10}
+              autoFocus
+            />
+          </Form.Item>
+          <Form.Item style={{ marginBottom: 0, textAlign: 'right' }}>
+            <Space>
+              <Button onClick={() => setMfaDisableOpen(false)} disabled={mfaActionLoading}>
+                Cancel
+              </Button>
+              <Button type="primary" danger htmlType="submit" loading={mfaActionLoading}>
+                Disable MFA
+              </Button>
+            </Space>
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* Admin: reset another user's MFA */}
+      <Modal
+        title={mfaResetTarget ? `Reset MFA for '${mfaResetTarget.username}'` : 'Reset MFA'}
+        open={!!mfaResetTarget}
+        onCancel={() => setMfaResetTarget(null)}
+        footer={null}
+        destroyOnClose
+      >
+        <Form form={mfaResetForm} layout="vertical" onFinish={handleMfaAdminResetSubmit}>
+          <p>
+            This will disable MFA and invalidate all backup codes for{' '}
+            <strong>{mfaResetTarget && mfaResetTarget.username}</strong>. The user must
+            re-enroll on their next login. The action is recorded in the audit log.
+          </p>
+          <Form.Item
+            name="reason"
+            label="Reason (required, will be audit-logged)"
+            rules={[
+              { required: true, message: 'Please provide a reason.' },
+              { min: 3, message: 'Reason is too short.' },
+              { max: 500, message: 'Reason is too long (max 500 characters).' },
+            ]}
+          >
+            <Input.TextArea rows={3} placeholder="e.g. Lost phone — verified identity via ticket #12345." />
+          </Form.Item>
+          <Form.Item style={{ marginBottom: 0, textAlign: 'right' }}>
+            <Space>
+              <Button onClick={() => setMfaResetTarget(null)} disabled={mfaActionLoading}>
+                Cancel
+              </Button>
+              <Button type="primary" danger htmlType="submit" loading={mfaActionLoading}>
+                Reset MFA
               </Button>
             </Space>
           </Form.Item>

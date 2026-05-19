@@ -75,6 +75,35 @@ Test HAProxy stats parsing
 ### test-build.sh
 Run build tests for the project
 
+## 🔐 MFA Admin Scripts
+
+### admin-mfa-reset-all.sh
+**Purpose:** Emergency — disable Multi-Factor Authentication for **every** user
+in one call. Use only when there is a mass loss of authenticator devices /
+inherited platform without working operators (Issue #18, v1.6.0).
+
+**Usage:**
+```bash
+# Interactive prompts ask for the admin Bearer token + reason
+./scripts/admin-mfa-reset-all.sh
+
+# Non-interactive (still requires double confirmation typed at the keyboard)
+API_URL=https://hap.example.com \
+ADMIN_TOKEN=eyJhbGciOi... \
+  ./scripts/admin-mfa-reset-all.sh
+```
+
+**Features:**
+- Calls `POST /api/mfa/admin-reset-all` (requires `users.is_admin = TRUE`)
+- Double confirmation: type `yes`, then `RESET ALL MFA` exactly
+- Required reason is recorded in `user_activity_logs`
+  (`action='mfa.disabled.admin_bulk_reset'`)
+- Deletes every backup code and invalidates pending MFA challenges
+
+**Safety:**
+- Irreversible — all users must re-enroll MFA afterwards
+- All other authentication (password, JWT, roles) is unaffected
+
 ## 🚨 Emergency Use Cases
 
 **1. Cluster Migration/Cleanup:**
@@ -99,6 +128,12 @@ Run build tests for the project
 
 # Debug stats problems
 ./scripts/debug-agent-stats-function.sh
+```
+
+**4. MFA Outage (mass lost authenticators):**
+```bash
+# Disable MFA for every user, then ask them to re-enroll
+./scripts/admin-mfa-reset-all.sh
 ```
 
 ## ⚠️ Safety Notes

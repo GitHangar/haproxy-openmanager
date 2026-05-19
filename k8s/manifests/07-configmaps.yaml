@@ -15,6 +15,33 @@ data:
   PUBLIC_URL: 'https://haproxy-openmanager.example.com'
   MANAGEMENT_BASE_URL: 'https://haproxy-openmanager.example.com'
 
+  # ---------------------------------------------------------------------------
+  # MFA rate-limits (slowapi format: "<count>/<second|minute|hour|day>").
+  # The shipped defaults assume the rate-limit key is per-USER (Bearer JWT)
+  # with a per-IP fallback. They are sized for thousands of concurrent
+  # operators in an org-wide MFA rollout. Pod restart required to apply.
+  #
+  # Defaults live in backend/middleware/mfa_rate_limits.py:
+  #   ENROLL_START='10/minute'      ENROLL_CONFIRM='10/minute'
+  #   DISABLE='10/minute'           REGENERATE_BACKUP_CODES='5/hour'
+  #   ADMIN_RESET='60/hour'         ADMIN_RESET_ALL='1/day'
+  # ---------------------------------------------------------------------------
+  # MFA_RATE_LIMIT_ENROLL_START: '10/minute'
+  # MFA_RATE_LIMIT_ENROLL_CONFIRM: '10/minute'
+  # MFA_RATE_LIMIT_DISABLE: '10/minute'
+  # MFA_RATE_LIMIT_REGENERATE_BACKUP_CODES: '5/hour'
+  # MFA_RATE_LIMIT_ADMIN_RESET: '60/hour'
+  # MFA_RATE_LIMIT_ADMIN_RESET_ALL: '1/day'
+
+  # ---------------------------------------------------------------------------
+  # Trusted reverse-proxy CIDRs for X-Forwarded-For. When the request peer
+  # falls inside one of these CIDRs and the user is NOT authenticated, the
+  # first hop of XFF becomes the rate-limit bucket. Empty (default) disables
+  # XFF parsing entirely — the safe choice when the topology is unknown.
+  # Example (in-cluster service mesh + nginx ingress on the default ranges):
+  # ---------------------------------------------------------------------------
+  # MFA_TRUSTED_PROXY_CIDRS: '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
+
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -25,9 +52,20 @@ metadata:
     app: haproxy-openmanager
     component: frontend
 data:
-  # Leave empty to use same-origin (window.location) in production
-  # For development, set to: 'http://localhost:8000'
-  REACT_APP_API_URL: ''
+  # NOTE — REACT_APP_* env vars are RUNTIME no-ops here.
+  # Create-React-App inlines REACT_APP_* values into the bundle at BUILD time
+  # (`npm run build`). The static bundle served by `serve -s build` does not
+  # consume runtime env vars, so anything set here has zero effect on
+  # window.location-based same-origin routing.
+  #
+  # The frontend always issues `/api/*` against window.location, which is
+  # routed by the ingress + nginx ConfigMap below to the backend service.
+  # No env vars are required for the frontend deployment.
+  #
+  # WARNING: Do NOT set REACT_APP_API_URL in your CI/CD pipeline either —
+  # if a value is supplied at build time it gets HARDCODED into the bundle
+  # and breaks every deployment that does not match that exact URL.
+  {}
 
 ---
 apiVersion: v1

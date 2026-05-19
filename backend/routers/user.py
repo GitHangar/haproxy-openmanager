@@ -38,18 +38,19 @@ async def get_users(authorization: str = Header(None)):
         # Get users with their roles (only active users)
         try:
             users = await conn.fetch("""
-                SELECT u.id, u.username, u.email, u.full_name, u.phone, u.role, u.is_active, 
-                       u.is_admin, u.is_verified, u.created_at, u.updated_at, u.last_login_at
+                SELECT u.id, u.username, u.email, u.full_name, u.phone, u.role, u.is_active,
+                       u.is_admin, u.is_verified, u.created_at, u.updated_at, u.last_login_at,
+                       COALESCE(u.mfa_enabled, FALSE) AS mfa_enabled
                 FROM users u
                 WHERE u.is_active = TRUE
                 ORDER BY u.username
             """)
         except Exception as schema_error:
             logger.warning(f"Schema error in users query, using fallback: {schema_error}")
-            # Fallback query with minimal columns
+            # Fallback query with minimal columns (pre-MFA-migration deploys)
             users = await conn.fetch("""
                 SELECT id, username, email, is_active, is_admin, created_at
-                FROM users 
+                FROM users
                 WHERE is_active = TRUE
                 ORDER BY username
             """)
