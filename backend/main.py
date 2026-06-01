@@ -8,7 +8,7 @@ import redis
 import asyncio
 from datetime import datetime, timedelta
 
-_version_info = {"version": "1.6.0", "releaseName": "Multi-Factor Authentication (MFA)", "releaseDate": "2026-05-18"}
+_version_info = {"version": "1.6.3", "releaseName": "Inactive server reactivation fix (issue #24)", "releaseDate": "2026-06-01"}
 for _vpath in ["/app/version.json", os.path.join(os.path.dirname(__file__), "..", "version.json")]:
     try:
         with open(_vpath) as _vf:

@@ -333,31 +333,38 @@ async def get_backends(
                 """)
         
         result = []
+        # Issue #24: servers must honor include_inactive exactly like the backend
+        # queries above. Pre-fix these sub-queries hardcoded `is_active = TRUE`
+        # (added in f34a6ee to hide soft-deleted entities), so a server toggled
+        # OFF (is_active=false) vanished from the UI with no way to reactivate it.
+        # Default callers (include_inactive=false) keep the is_active filter →
+        # byte-identical behavior; include_inactive=true now also returns inactive
+        # (disabled / soft-deleted) servers. last_config_status is selected so the
+        # frontend can tell DISABLED (re-enableable) from DELETION (pending delete).
+        server_active_filter = "" if include_inactive else "AND is_active = TRUE"
         for backend in backends:
-            # Get servers for this backend with cluster_id (ONLY show active servers)
-            # CRITICAL FIX: Add is_active = TRUE filter to prevent soft-deleted servers from appearing
             if cluster_id:
-                servers = await conn.fetch("""
+                servers = await conn.fetch(f"""
                     SELECT id, server_name, server_address, server_port, weight, maxconn,
                            check_enabled, check_port, backup_server, ssl_enabled, ssl_verify, ssl_certificate_id,
                            ssl_sni, ssl_min_ver, ssl_max_ver, ssl_ciphers,
                            cookie_value, inter, fall, rise,
-                           is_active, cluster_id,
+                           is_active, cluster_id, last_config_status,
                            haproxy_status, haproxy_status_updated_at, backend_name
-                    FROM backend_servers 
-                    WHERE backend_name = $1 AND cluster_id = $2 AND is_active = TRUE ORDER BY server_name
+                    FROM backend_servers
+                    WHERE backend_name = $1 AND cluster_id = $2 {server_active_filter} ORDER BY server_name
                 """, backend["name"], cluster_id)
             else:
-                servers = await conn.fetch("""
+                servers = await conn.fetch(f"""
                     SELECT id, server_name, server_address, server_port, weight, maxconn,
                            check_enabled, check_port, backup_server, ssl_enabled, ssl_verify, ssl_certificate_id,
                            ssl_sni, ssl_min_ver, ssl_max_ver, ssl_ciphers,
                            cookie_value, inter, fall, rise,
-                           is_active, cluster_id,
+                           is_active, cluster_id, last_config_status,
                            haproxy_status, haproxy_status_updated_at, backend_name
-                    FROM backend_servers 
-                    WHERE backend_name = $1 AND is_active = TRUE ORDER BY server_name
-                """, backend["name"]) 
+                    FROM backend_servers
+                    WHERE backend_name = $1 {server_active_filter} ORDER BY server_name
+                """, backend["name"])
             
             # Prepare server list with real-time HAProxy status from agents
             server_list = []
@@ -413,6 +420,7 @@ async def get_backends(
                     "fall": s.get("fall"),
                     "rise": s.get("rise"),
                     "is_active": s["is_active"],
+                    "last_config_status": s.get("last_config_status") or "APPLIED",  # Issue #24: lets UI distinguish DISABLED (re-enableable) from DELETION
                     "status": server_status,
                     "status_age_minutes": status_age_minutes,
                     "last_status_update": s.get("haproxy_status_updated_at").isoformat().replace('+00:00', 'Z') if s.get("haproxy_status_updated_at") else None,
@@ -1909,12 +1917,12 @@ async def toggle_server(server_id: int, request: Request, authorization: str = H
 
         conn = await get_database_connection()
         
-        # Get server info
+        # Get server info. Issue #24: fetch the FULL row (not just 5 columns) so we
+        # can snapshot the pre-toggle state for reject-rollback (see config version below).
         server = await conn.fetchrow("""
-            SELECT id, server_name, backend_name, is_active, cluster_id
-            FROM backend_servers WHERE id = $1
+            SELECT * FROM backend_servers WHERE id = $1
         """, server_id)
-        
+
         if not server:
             await close_database_connection(conn)
             raise HTTPException(status_code=404, detail="Server not found")
@@ -1975,22 +1983,45 @@ async def toggle_server(server_id: int, request: Request, authorization: str = H
                 
                 # Generate new HAProxy config (after database commit)
                 config_content = await generate_haproxy_config_for_cluster(cluster_id)
-                
+
                 # Create new config version
                 config_hash = hashlib.sha256(config_content.encode()).hexdigest()
                 version_name = f"server-{server_id}-toggle-{int(time.time())}"
-                
+
                 # Get system admin user ID for created_by
                 conn2 = await get_database_connection()
                 admin_user_id = await conn2.fetchval("SELECT id FROM users WHERE username = 'admin' LIMIT 1") or 1
-                
+
+                # Issue #24: persist an entity snapshot so a Reject of this toggle
+                # rolls back is_active to its pre-toggle value. Pre-fix the toggle's
+                # config version carried NO metadata, so reject only reset
+                # last_config_status and the server stayed disabled (out of sync with
+                # the still-active live config). Mirrors the server-edit snapshot path;
+                # reject's rollback_entity_from_snapshot('server') restores is_active.
+                import json
+                from utils.entity_snapshot import save_entity_snapshot
+                entity_snapshot_metadata = await save_entity_snapshot(
+                    conn=conn2,
+                    entity_type="server",
+                    entity_id=server_id,
+                    old_values=dict(server),            # full pre-toggle row
+                    new_values={"is_active": new_status},
+                    operation="UPDATE",
+                )
+                old_config = await conn2.fetchval("""
+                    SELECT config_content FROM config_versions
+                    WHERE cluster_id = $1 AND status = 'APPLIED' AND is_active = TRUE
+                    ORDER BY created_at DESC LIMIT 1
+                """, cluster_id)
+                metadata = {"pre_apply_snapshot": old_config or "", **entity_snapshot_metadata}
+
                 # Create PENDING config version
                 config_version_id = await conn2.fetchval("""
-                    INSERT INTO config_versions 
-                    (cluster_id, version_name, config_content, checksum, created_by, is_active, status)
-                    VALUES ($1, $2, $3, $4, $5, FALSE, 'PENDING')
+                    INSERT INTO config_versions
+                    (cluster_id, version_name, config_content, checksum, created_by, is_active, status, metadata)
+                    VALUES ($1, $2, $3, $4, $5, FALSE, 'PENDING', $6)
                     RETURNING id
-                """, cluster_id, version_name, config_content, config_hash, admin_user_id)
+                """, cluster_id, version_name, config_content, config_hash, admin_user_id, json.dumps(metadata))
                 
                 logger.error(f"SERVER TOGGLE DEBUG: Created PENDING config version {version_name} for cluster {cluster_id}")
                 

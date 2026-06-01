@@ -50,9 +50,62 @@ async def ensure_agents_table():
         await conn.execute("ALTER TYPE config_status ADD VALUE IF NOT EXISTS 'DELETION';")
         logger.info("Ensured REJECTED and DELETION values exist in config_status enum.")
 
-        # First, create essential tables if they don't exist
-        await create_essential_tables(conn)
-        
+        # First, create essential tables if they don't exist.
+        #
+        # Rolling-restart resilience: create_essential_tables() runs idempotent
+        # CREATE ... IF NOT EXISTS statements on every startup. Its CREATE INDEX
+        # block needs a SHARE lock that conflicts with concurrent writes (e.g.
+        # agent heartbeats updating backend_servers/agents). During a redeploy a
+        # writer can hold that lock, so the DDL blocked for the full 60s
+        # command_timeout -> TimeoutError -> startup crash -> crash-loop.
+        #
+        # Fix: fail fast on locks (lock_timeout), retry briefly, and on
+        # persistent contention SKIP the idempotent bootstrap and continue — on
+        # an established DB the objects already exist; a fresh DB has no writers
+        # so the first attempt always succeeds. lock_timeout is scoped to this
+        # call and RESET afterwards, so every other migration below keeps its
+        # original (wait-indefinitely) behavior. Non-lock errors still propagate
+        # (genuine schema problems must NOT be masked).
+        import asyncio as _asyncio
+        _lock_excs = (_asyncio.TimeoutError,)
+        try:
+            import asyncpg as _asyncpg
+            _lock_excs = _lock_excs + (
+                _asyncpg.exceptions.LockNotAvailableError,
+                _asyncpg.exceptions.QueryCanceledError,
+            )
+        except Exception:
+            pass
+        try:
+            await conn.execute("SET lock_timeout = '10s'")
+        except Exception:
+            pass
+        try:
+            for _attempt in range(1, 4):
+                try:
+                    await create_essential_tables(conn)
+                    break
+                except _lock_excs as _lock_err:
+                    if _attempt < 3:
+                        logger.warning(
+                            f"create_essential_tables: lock contention "
+                            f"(attempt {_attempt}/3), retrying in 3s "
+                            f"({type(_lock_err).__name__})"
+                        )
+                        await _asyncio.sleep(3)
+                    else:
+                        logger.warning(
+                            "create_essential_tables: persistent lock contention; "
+                            "skipping idempotent schema bootstrap and continuing "
+                            "startup (objects already exist on an established DB) "
+                            f"({type(_lock_err).__name__})"
+                        )
+        finally:
+            try:
+                await conn.execute("RESET lock_timeout")
+            except Exception:
+                pass
+
         # Ensure status column exists in config_versions table
         status_column_exists = await conn.fetchval("""
             SELECT 1 FROM information_schema.columns 
@@ -1639,13 +1692,105 @@ async def ensure_agent_activity_logs_table():
             await close_database_connection(conn)
         # Don't raise - this is not critical for system operation
 
+# Schema-version gate for the migration runner.
+#
+# >>> BUMP THIS whenever you add/modify ANY step in _run_all_migrations_inner()
+# >>> that changes the schema (table/column/index/constraint) OR seeded/role data
+# >>> (e.g. update_system_roles_to_enterprise_rbac). Otherwise the new step will
+# >>> NOT run on databases already marked at the current version.
+#
+# When the DB already records >= this version, run_all_migrations() skips the
+# whole (lock-heavy) idempotent sequence, so redeploys/scale-ups issue NO DDL and
+# a concurrently-serving replica's traffic cannot block ALTER / CREATE INDEX (the
+# rolling-deploy startup crash that motivated this gate).
+#
+# Backward compatibility (the product runs at many versions across companies):
+#  - First start on this code: no marker -> applied_version is NULL -> the FULL
+#    sequence runs (upgrades any prior version), THEN the marker is written. So
+#    upgrading from any older version is unaffected.
+#  - The marker is written ONLY after _run_all_migrations_inner() completes with
+#    no exception, so an interrupted/failed migration never marks an incomplete
+#    schema as done — the next start retries.
+#  - Behavior change vs the historical "re-run every idempotent ensure_* on every
+#    start": once marked, same-version restarts no longer re-run (and therefore no
+#    longer auto-repair manual drift). To force a re-run, bump SCHEMA_VERSION or
+#    delete the schema_migrations row.
+SCHEMA_VERSION = 1
+
+
 async def run_all_migrations():
-    """Run all database migrations"""
+    """Run all database migrations.
+
+    Hardened for multiple backend replicas / rolling deploys:
+    - A session-level advisory lock serializes the run so only one pod migrates
+      at a time (others wait, then hit the version gate and skip). It is
+      session-scoped, so it auto-releases if a pod dies mid-migration.
+    - A schema-version marker (schema_migrations) gates the run: when the DB is
+      already at SCHEMA_VERSION the whole idempotent sequence is skipped, so no
+      DDL is issued and a serving replica's traffic can't block it.
+    If the advisory lock or marker can't be used, we fall back to running the
+    (idempotent) migrations rather than crashing startup.
+    """
     logger.info("Starting database migrations...")
-    
+    MIGRATION_ADVISORY_LOCK_KEY = 1836016242  # single-key advisory space ("migr"); distinct from the (ns,id) locks used elsewhere
+    lock_conn = None
+    lock_acquired = False
+    try:
+        lock_conn = await get_database_connection()
+        try:
+            await lock_conn.execute("SELECT pg_advisory_lock($1)", MIGRATION_ADVISORY_LOCK_KEY)
+            lock_acquired = True
+            logger.info("Acquired migration advisory lock (migrations serialized across pods)")
+        except Exception as _lock_e:
+            logger.warning(f"Could not acquire migration advisory lock; proceeding (migrations are idempotent): {_lock_e}")
+
+        # Schema-version gate: skip the lock-heavy sequence if the DB is current.
+        applied_version = None
+        try:
+            await lock_conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    version INTEGER NOT NULL,
+                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT schema_migrations_singleton CHECK (id = 1)
+                )
+            """)
+            applied_version = await lock_conn.fetchval("SELECT version FROM schema_migrations WHERE id = 1")
+        except Exception as _mk_e:
+            logger.warning(f"schema_migrations marker unavailable; running full migrations: {_mk_e}")
+            applied_version = None
+
+        if applied_version is not None and applied_version >= SCHEMA_VERSION:
+            logger.info(f"Schema already at version {applied_version} (>= {SCHEMA_VERSION}); skipping migration run.")
+            return
+
+        await _run_all_migrations_inner()
+
+        try:
+            await lock_conn.execute("""
+                INSERT INTO schema_migrations (id, version, applied_at)
+                VALUES (1, $1, CURRENT_TIMESTAMP)
+                ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, applied_at = EXCLUDED.applied_at
+            """, SCHEMA_VERSION)
+            logger.info(f"Recorded schema version {SCHEMA_VERSION} in schema_migrations.")
+        except Exception as _wr_e:
+            logger.warning(f"Could not record schema version marker (migrations still applied): {_wr_e}")
+    finally:
+        if lock_acquired and lock_conn is not None:
+            try:
+                await lock_conn.execute("SELECT pg_advisory_unlock($1)", MIGRATION_ADVISORY_LOCK_KEY)
+            except Exception:
+                pass
+        if lock_conn is not None:
+            await close_database_connection(lock_conn)
+
+
+async def _run_all_migrations_inner():
+    """The full idempotent migration sequence. Runs under the migration advisory
+    lock and is gated by the schema-version marker in run_all_migrations()."""
     # First, ensure basic database schema exists
     await run_init_sql()
-    
+
     # Then run additional migrations
     await ensure_agents_table()
     await ensure_config_versions_metadata_column()

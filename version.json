@@ -1,5 +1,5 @@
 {
-  "version": "1.6.2",
-  "releaseName": "Agent auth fix (issue #22)",
-  "releaseDate": "2026-05-30"
+  "version": "1.6.3",
+  "releaseName": "Inactive server reactivation fix (issue #24)",
+  "releaseDate": "2026-06-01"
 }

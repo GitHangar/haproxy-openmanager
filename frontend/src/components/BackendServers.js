@@ -172,11 +172,13 @@ const BackendServers = () => {
     
     setLoading(true);
     try {
-      const params = { cluster_id: selectedCluster.id };
-      
+      // Issue #24: request inactive entities so DISABLED (toggled-OFF) servers
+      // are returned and can be reactivated from the UI (mirrors ApplyManagement).
+      const params = { cluster_id: selectedCluster.id, include_inactive: true };
+
       // CRITICAL FIX: Add cache busting to prevent stale data from appearing
       // Browser/axios may cache GET requests, causing deleted backends to reappear
-      const response = await axios.get('/api/backends', { 
+      const response = await axios.get('/api/backends', {
         params,
         headers: {
           'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -184,7 +186,21 @@ const BackendServers = () => {
           'Expires': '0'
         }
       });
-      const fetchedBackends = response.data.backends || [];
+      // Issue #24: we now request include_inactive=true so DISABLED servers come
+      // back. That ALSO returns soft-deleted (is_active=false) BACKENDS, which the
+      // pre-change default (include_inactive=false -> WHERE is_active=TRUE) hid.
+      // Restore that filter here so soft-deleted backends don't reappear in the
+      // normal view (preserve commit f34a6ee), while still keeping inactive
+      // SERVERS inside active backends. Then hide ONLY soft-deleted-pending
+      // servers (last_config_status==='DELETION'); DISABLED servers (toggled
+      // OFF — status PENDING/APPLIED) stay visible so operators can re-enable
+      // them. Single chokepoint covers counts, expanded rows, and All Servers tab.
+      const fetchedBackends = (response.data.backends || [])
+        .filter(b => b.is_active !== false)
+        .map(b => ({
+          ...b,
+          servers: (b.servers || []).filter(s => s.last_config_status !== 'DELETION'),
+        }));
       setBackends(fetchedBackends);
       // CRITICAL FIX: Apply status filters after fetching to maintain filter state
       // This prevents backends from disappearing when updated (e.g., APPLIED → PENDING)
@@ -1289,6 +1305,7 @@ const BackendServers = () => {
           />
           <strong>{text}</strong>
           {record.backup_server && <Tag color="orange">Backup</Tag>}
+          {!record.is_active && <Tag color="red">Inactive</Tag>}
         </Space>
       ),
     },
