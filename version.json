@@ -1,5 +1,5 @@
 {
-  "version": "1.6.3",
-  "releaseName": "Inactive server reactivation fix (issue #24)",
-  "releaseDate": "2026-06-01"
+  "version": "1.6.4",
+  "releaseName": "nginx security update (poolslip advisory)",
+  "releaseDate": "2026-06-02"
 }
