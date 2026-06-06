@@ -153,7 +153,7 @@ collect_system_info() {
     "disk_space": $disk_bytes,
     "ip_address": "$ip_address",
     "network_interfaces": ["${network_interfaces//,/\",\"}"],
-    "capabilities": ["haproxy_management", "ssl_deployment", "config_reload", "systemd_service"]
+    "capabilities": ["haproxy_management", "ssl_deployment", "config_reload", "systemd_service", "keepalived_management"]
 SYSTEM_INFO_EOF
 }
 
@@ -1289,7 +1289,7 @@ collect_system_info() {
     "disk_space": $disk_bytes,
     "ip_address": "$ip_address",
     "network_interfaces": ["${network_interfaces//,/\",\"}"],
-    "capabilities": ["haproxy_management", "ssl_deployment", "config_reload", "systemd_service"]
+    "capabilities": ["haproxy_management", "ssl_deployment", "config_reload", "systemd_service", "keepalived_management"]
 SYSTEM_INFO_EOF
 }
 
@@ -1309,7 +1309,7 @@ get_keepalive_state() {
     # Method 1: journalctl (most reliable on RHEL/CentOS/Ubuntu with systemd)
     if command -v journalctl &>/dev/null; then
         state=$(journalctl -u keepalived -n 50 --no-pager 2>/dev/null \
-            | grep -oE "(MASTER|BACKUP)" | tail -1)
+            | grep -oE "(MASTER|BACKUP|FAULT)" | tail -1)
     fi
 
     # Method 2: Fallback to log files (for non-systemd or restricted journalctl)
@@ -1317,22 +1317,27 @@ get_keepalive_state() {
         for logfile in /var/log/messages /var/log/syslog /var/log/keepalived.log; do
             if [[ -r "$logfile" ]]; then
                 state=$(tail -200 "$logfile" 2>/dev/null \
-                    | grep -i keepalived | grep -oE "(MASTER|BACKUP)" | tail -1)
+                    | grep -i keepalived | grep -oE "(MASTER|BACKUP|FAULT)" | tail -1)
                 [[ -n "$state" ]] && break
             fi
         done
     fi
 
-    # Method 3: Check VIP presence on network interfaces (confirms MASTER)
+    # Method 3: VIP presence on local interfaces — the most portable signal, independent
+    # of logging/journald (works on any distro / init system / keepalived install type).
+    # MASTER iff ANY configured VIP is actually held locally; keepalived up but holding no
+    # VIP => BACKUP. Exact whole-line IP match (grep -Fxq) so 10.0.0.1 can't falsely match
+    # 10.0.0.10/100, and ALL configured VIPs are checked (not just the first).
     if [[ -z "$state" ]] && [[ -r /etc/keepalived/keepalived.conf ]]; then
-        local conf_vip=$(grep -A10 'virtual_ipaddress' /etc/keepalived/keepalived.conf 2>/dev/null \
-            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-        if [[ -n "$conf_vip" ]]; then
-            if ip addr show 2>/dev/null | grep -q "$conf_vip"; then
-                state="MASTER"
-            else
-                state="BACKUP"
-            fi
+        local conf_vips=$(grep -A20 'virtual_ipaddress' /etc/keepalived/keepalived.conf 2>/dev/null \
+            | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
+        if [[ -n "$conf_vips" ]]; then
+            local local_ips=$(ip -4 -o addr show 2>/dev/null | grep -oE 'inet ([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $2}')
+            state="BACKUP"
+            local _cvip
+            for _cvip in $conf_vips; do
+                if printf '%s\n' "$local_ips" | grep -Fxq "$_cvip"; then state="MASTER"; break; fi
+            done
         fi
     fi
 
@@ -1665,6 +1670,163 @@ check_ssl_updates() {
 }
 
 # Reload HAProxy service (Linux specific)
+# Issue #27 (v1.7.0) — HA/VIP (Keepalived) convergence. OPT-IN and inert by default:
+# a node with no APPLIED VIP gets status=not_configured and (lacking our ownership
+# marker) does NOTHING. Never clobbers a hand-managed keepalived. Uses $AGENT_TOKEN
+# (kept in sync with the live token in both daemon loops).
+fetch_and_deploy_keepalived_config() {
+    local marker="# Managed by HAProxy OpenManager"
+    local resp status http_code we_own="false" conf chk
+
+    # Timeouts so a hung management server can never stall the daemon loop.
+    resp=$(curl -k -s --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -X GET \
+        "$MANAGEMENT_URL/api/agents/$AGENT_NAME/keepalived-config" \
+        -H "X-API-Key: $AGENT_TOKEN" 2>/dev/null) || return 0
+    http_code="${resp##*$'\n'}"   # last line = HTTP status
+    resp="${resp%$'\n'*}"          # everything before = JSON body
+    [[ -z "$resp" ]] && return 0
+    status=$(echo "$resp" | jq -r '.status // "unknown"' 2>/dev/null)
+    # A 404 means this agent was deleted server-side (node decommissioned / pool removed):
+    # self-heal teardown OUR keepalived so a removed node stops advertising the VIP. The
+    # teardown branch below is marker-guarded, so a node we don't manage stays untouched.
+    [[ "$http_code" == "404" ]] && status="teardown"
+    # Cluster-driven keepalived.conf path (delivered in every response); default is universal.
+    conf=$(echo "$resp" | jq -r '.config_path // empty' 2>/dev/null)
+    [[ -z "$conf" || "$conf" == "null" ]] && conf="/etc/keepalived/keepalived.conf"
+    chk="$(dirname "$conf")/check_haproxy.sh"
+    if [[ -f "$conf" ]] && grep -q "$marker" "$conf" 2>/dev/null; then we_own="true"; fi
+
+    _kp_report() {  # $1=state  $2=vip_id(or empty)  $3=hash  $4=message
+        local vid="${2:-null}"; [[ -z "$2" ]] && vid="null"
+        curl -k -s --connect-timeout 10 --max-time 30 -X POST "$MANAGEMENT_URL/api/agents/$AGENT_NAME/keepalived-status" \
+            -H "X-API-Key: $AGENT_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"vip_id\":${vid},\"state\":\"$1\",\"config_hash\":\"${3:-}\",\"message\":\"${4:-}\"}" \
+            >/dev/null 2>&1 || true
+    }
+    _kp_teardown() {
+        # $1=purge ("true" only on an explicit operator opt-in delete). Default: stop+disable
+        # keepalived and remove OUR config (the VIP is released) but KEEP the package — the safe
+        # enterprise default. Purge only when opted in AND we are the ones who installed it
+        # (the .hom_installed marker); never remove a package the admin pre-installed.
+        local purge="${1:-false}" marker_inst; marker_inst="$(dirname "$conf")/.hom_installed"
+        log "INFO" "KEEPALIVED: tearing down our managed VIP config (purge=$purge)"
+        systemctl stop keepalived >/dev/null 2>&1
+        systemctl disable keepalived >/dev/null 2>&1
+        rm -f "$conf" "$chk"
+        if [[ "$purge" == "true" && -f "$marker_inst" ]]; then
+            log "INFO" "KEEPALIVED: uninstalling keepalived package (operator opt-in)"
+            if command -v apt-get >/dev/null 2>&1; then timeout 300 apt-get purge -y -qq keepalived >/dev/null 2>&1
+            elif command -v dnf >/dev/null 2>&1; then timeout 300 dnf remove -y -q keepalived >/dev/null 2>&1
+            elif command -v yum >/dev/null 2>&1; then timeout 300 yum remove -y -q keepalived >/dev/null 2>&1
+            elif command -v zypper >/dev/null 2>&1; then timeout 300 zypper --non-interactive remove -y keepalived >/dev/null 2>&1
+            elif command -v apk >/dev/null 2>&1; then timeout 300 apk del keepalived >/dev/null 2>&1
+            fi
+            rm -f "$marker_inst"
+            if command -v keepalived >/dev/null 2>&1; then
+                _kp_report "disabled" "" "" "config removed; package uninstall attempted (still present)"
+            else
+                _kp_report "disabled" "" "" "torn down + keepalived package uninstalled"
+            fi
+        elif [[ "$purge" == "true" ]]; then
+            log "INFO" "KEEPALIVED: package was pre-existing (not installed by us) — left in place; our config removed"
+            _kp_report "disabled" "" "" "torn down (package left: pre-existing, not installed by us)"
+        else
+            _kp_report "disabled" "" "" "torn down"
+        fi
+    }
+
+    case "$status" in
+        available) : ;;  # fall through to converge
+        teardown)
+            # Explicit server-side delete. Honor the operator's opt-in package purge (.purge);
+            # marker-guarded inside _kp_teardown, and a node we don't own (no marker conf) is a no-op.
+            local _kp_purge; _kp_purge=$(echo "$resp" | jq -r '.purge // false' 2>/dev/null)
+            [[ "$we_own" == "true" ]] && _kp_teardown "$_kp_purge"
+            return 0 ;;
+        not_configured)
+            [[ "$we_own" == "true" ]] && _kp_teardown "false"   # T-2 orphan self-heal: graceful only, never purge
+            return 0 ;;
+        *) return 0 ;;   # unknown / auth error → no-op
+    esac
+
+    # --- status == available: converge ---
+    local vip_id new_conf check_script install_if new_hash
+    vip_id=$(echo "$resp" | jq -r '.keepalived.vip_id // empty' 2>/dev/null)
+    new_conf=$(echo "$resp" | jq -r '.keepalived.config_content // empty' 2>/dev/null)
+    new_hash=$(echo "$resp" | jq -r '.keepalived.config_hash // empty' 2>/dev/null)
+    check_script=$(echo "$resp" | jq -r '.keepalived.check_script // empty' 2>/dev/null)
+    install_if=$(echo "$resp" | jq -r '.keepalived.install_if_missing // false' 2>/dev/null)
+    [[ -z "$new_conf" ]] && return 0
+
+    # Ownership guard: never overwrite a keepalived.conf we don't own.
+    if [[ -f "$conf" && "$we_own" != "true" ]]; then
+        log "WARN" "KEEPALIVED: $conf is externally managed — refusing to overwrite"
+        _kp_report "externally_managed" "$vip_id" "" "pre-existing unmanaged keepalived.conf"
+        return 0
+    fi
+
+    # Hybrid install: install keepalived only if missing.
+    if ! command -v keepalived >/dev/null 2>&1; then
+        if [[ "$install_if" == "true" ]]; then
+            log "INFO" "KEEPALIVED: installing package..."
+            if command -v apt-get >/dev/null 2>&1; then timeout 300 apt-get install -y -qq keepalived >/dev/null 2>&1
+            elif command -v dnf >/dev/null 2>&1; then timeout 300 dnf install -y -q keepalived >/dev/null 2>&1
+            elif command -v yum >/dev/null 2>&1; then timeout 300 yum install -y -q keepalived >/dev/null 2>&1
+            elif command -v zypper >/dev/null 2>&1; then timeout 300 zypper --non-interactive install -y keepalived >/dev/null 2>&1
+            elif command -v apk >/dev/null 2>&1; then timeout 300 apk add --no-cache keepalived >/dev/null 2>&1
+            fi
+        fi
+        if ! command -v keepalived >/dev/null 2>&1; then
+            log "ERROR" "KEEPALIVED: not installed/available"
+            _kp_report "error" "$vip_id" "" "keepalived not installed"
+            return 0
+        fi
+        # We installed keepalived (it was missing) — drop a marker so an opt-in uninstall on
+        # delete removes only OUR install, never an admin's pre-existing keepalived package.
+        mkdir -p "$(dirname "$conf")" 2>/dev/null; : > "$(dirname "$conf")/.hom_installed" 2>/dev/null
+    fi
+
+    # Idempotency: skip write+reload when the on-disk content already matches.
+    if [[ -f "$conf" ]]; then
+        local cur_hash would_hash
+        cur_hash=$(md5sum "$conf" 2>/dev/null | awk '{print $1}')
+        would_hash=$(printf '%s' "$new_conf" | md5sum 2>/dev/null | awk '{print $1}')
+        if [[ -n "$cur_hash" && "$cur_hash" == "$would_hash" ]]; then
+            return 0
+        fi
+    fi
+
+    mkdir -p "$(dirname "$conf")"
+    if [[ -n "$check_script" ]]; then
+        printf '%s' "$check_script" > "$chk"
+        chown root:root "$chk" 2>/dev/null
+        chmod 0755 "$chk"   # root-owned, not world-writable — required by enable_script_security
+    fi
+    # Validate on a TEMP file and swap in only on success: a bad render must never land on
+    # $conf (it would also make the md5 idempotency guard above suppress retries forever).
+    local tmp_conf="${conf}.hom.tmp"
+    printf '%s' "$new_conf" > "$tmp_conf"
+    chmod 0644 "$tmp_conf"
+    if ! keepalived -t -f "$tmp_conf" >/dev/null 2>&1; then
+        rm -f "$tmp_conf"
+        log "ERROR" "KEEPALIVED: config validation failed (keepalived -t) — keeping current config, not (re)starting"
+        _kp_report "error" "$vip_id" "$new_hash" "keepalived -t failed"
+        return 0
+    fi
+    mv -f "$tmp_conf" "$conf"
+    chown root:root "$conf" 2>/dev/null
+    chmod 0644 "$conf"
+    systemctl enable keepalived >/dev/null 2>&1
+    if systemctl reload keepalived >/dev/null 2>&1 || systemctl restart keepalived >/dev/null 2>&1; then
+        log "INFO" "KEEPALIVED: applied config for VIP ${vip_id}"
+        _kp_report "enabled" "$vip_id" "$new_hash" "applied"
+    else
+        log "ERROR" "KEEPALIVED: reload/restart failed"
+        _kp_report "error" "$vip_id" "$new_hash" "reload/restart failed"
+    fi
+    return 0
+}
+
 reload_haproxy_service() {
     log "INFO" "Performing zero-downtime HAProxy configuration reload..."
     
@@ -2356,8 +2518,12 @@ run_daemon() {
         _loop_count=$((_loop_count + 1))
         if (( _loop_count % 5 == 0 )); then
             check_ssl_updates
+            # Issue #27 — HA/VIP convergence at the SSL cadence (inert for non-VIP nodes)
+            if type fetch_and_deploy_keepalived_config &>/dev/null; then
+                fetch_and_deploy_keepalived_config
+            fi
         fi
-        
+
         check_agent_upgrade
     done
     
@@ -2789,28 +2955,31 @@ SYSTEM_INFO_EOF
 
         if command -v journalctl &>/dev/null; then
             state=$(journalctl -u keepalived -n 50 --no-pager 2>/dev/null \
-                | grep -oE "(MASTER|BACKUP)" | tail -1)
+                | grep -oE "(MASTER|BACKUP|FAULT)" | tail -1)
         fi
 
         if [[ -z "$state" ]]; then
             for logfile in /var/log/messages /var/log/syslog /var/log/keepalived.log; do
                 if [[ -r "$logfile" ]]; then
                     state=$(tail -200 "$logfile" 2>/dev/null \
-                        | grep -i keepalived | grep -oE "(MASTER|BACKUP)" | tail -1)
+                        | grep -i keepalived | grep -oE "(MASTER|BACKUP|FAULT)" | tail -1)
                     [[ -n "$state" ]] && break
                 fi
             done
         fi
 
+        # Method 3: VIP presence on local interfaces — portable, logging-independent.
+        # MASTER iff ANY configured VIP is held locally (exact whole-line match, all VIPs).
         if [[ -z "$state" ]] && [[ -r /etc/keepalived/keepalived.conf ]]; then
-            local conf_vip=$(grep -A10 'virtual_ipaddress' /etc/keepalived/keepalived.conf 2>/dev/null \
-                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            if [[ -n "$conf_vip" ]]; then
-                if ip addr show 2>/dev/null | grep -q "$conf_vip"; then
-                    state="MASTER"
-                else
-                    state="BACKUP"
-                fi
+            local conf_vips=$(grep -A20 'virtual_ipaddress' /etc/keepalived/keepalived.conf 2>/dev/null \
+                | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}')
+            if [[ -n "$conf_vips" ]]; then
+                local local_ips=$(ip -4 -o addr show 2>/dev/null | grep -oE 'inet ([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $2}')
+                state="BACKUP"
+                local _cvip
+                for _cvip in $conf_vips; do
+                    if printf '%s\n' "$local_ips" | grep -Fxq "$_cvip"; then state="MASTER"; break; fi
+                done
             fi
         fi
 
@@ -2849,7 +3018,15 @@ SYSTEM_INFO_EOF
         local keepalive_info=$(get_keepalive_state)
         local keepalive_state=$(echo "$keepalive_info" | cut -d'|' -f1)
         local keepalive_ip=$(echo "$keepalive_info" | cut -d'|' -f2)
-        
+
+        # Network interfaces (DAEMON) — reported so the HA/VIP create form can offer this
+        # node's real NICs. /sys/class/net is universal across distros (no iproute2 needed);
+        # exclude loopback here, and the UI further hides docker/veth/bridge interfaces. Empty
+        # -> "[]" (never "[\"\"]") so a node with no NICs doesn't surface a blank option.
+        local net_ifaces ni_json
+        net_ifaces=$(ls /sys/class/net 2>/dev/null | grep -vE '^lo$' | tr '\n' ',' | sed 's/,$//')
+        if [ -n "$net_ifaces" ]; then ni_json="[\"${net_ifaces//,/\",\"}\"]"; else ni_json="[]"; fi
+
         # Prepare heartbeat payload with all data
         local heartbeat_payload="{
             \"name\": \"$AGENT_NAME\",
@@ -2859,6 +3036,8 @@ SYSTEM_INFO_EOF
             \"platform\": \"$platform\",
             \"architecture\": \"$(uname -m)\",
             \"version\": \"{{AGENT_VERSION}}\",
+            \"capabilities\": [\"haproxy_management\", \"ssl_deployment\", \"config_reload\", \"systemd_service\", \"keepalived_management\"],
+            \"network_interfaces\": $ni_json,
             \"haproxy_status\": \"$haproxy_status\",
             \"haproxy_version\": \"$haproxy_version\",
             \"cluster_id\": $CLUSTER_ID,
@@ -3041,9 +3220,159 @@ CONFIG_RESPONSE_EOF
     HAPROXY_BIN="${HAPROXY_BIN_PATH}"
     HAPROXY_CONFIG="${HAPROXY_CONFIG_PATH}"
     log "INFO" "DAEMON: Initialized HAProxy paths - bin: $HAPROXY_BIN, config: $HAPROXY_CONFIG"
-    
+
+    # Issue #27 (v1.7.0) — HA/VIP (Keepalived) convergence (DAEMON copy). Inert by
+    # default: a node with no APPLIED VIP gets not_configured and (lacking our marker)
+    # does nothing. Never clobbers a hand-managed keepalived. $AGENT_TOKEN is synced to
+    # the live token at the top of each loop iteration below.
+    fetch_and_deploy_keepalived_config() {
+        local marker="# Managed by HAProxy OpenManager"
+        local resp status http_code we_own="false" conf chk
+
+        # Timeouts so a hung management server can never stall the daemon loop.
+        resp=$(curl -k -s --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -X GET \
+            "$MANAGEMENT_URL/api/agents/$AGENT_NAME/keepalived-config" \
+            -H "X-API-Key: $AGENT_TOKEN" 2>/dev/null) || return 0
+        http_code="${resp##*$'\n'}"   # last line = HTTP status
+        resp="${resp%$'\n'*}"          # everything before = JSON body
+        [[ -z "$resp" ]] && return 0
+        status=$(echo "$resp" | jq -r '.status // "unknown"' 2>/dev/null)
+        # A 404 means this agent was deleted server-side (node decommissioned / pool removed):
+        # self-heal teardown OUR keepalived so a removed node stops advertising the VIP. The
+        # teardown branch below is marker-guarded, so a node we don't manage stays untouched.
+        [[ "$http_code" == "404" ]] && status="teardown"
+        # Cluster-driven keepalived.conf path (delivered in every response); default is universal.
+        conf=$(echo "$resp" | jq -r '.config_path // empty' 2>/dev/null)
+        [[ -z "$conf" || "$conf" == "null" ]] && conf="/etc/keepalived/keepalived.conf"
+        chk="$(dirname "$conf")/check_haproxy.sh"
+        if [[ -f "$conf" ]] && grep -q "$marker" "$conf" 2>/dev/null; then we_own="true"; fi
+
+        _kp_report() {
+            local vid="${2:-null}"; [[ -z "$2" ]] && vid="null"
+            curl -k -s --connect-timeout 10 --max-time 30 -X POST "$MANAGEMENT_URL/api/agents/$AGENT_NAME/keepalived-status" \
+                -H "X-API-Key: $AGENT_TOKEN" -H "Content-Type: application/json" \
+                -d "{\"vip_id\":${vid},\"state\":\"$1\",\"config_hash\":\"${3:-}\",\"message\":\"${4:-}\"}" \
+                >/dev/null 2>&1 || true
+        }
+        _kp_teardown() {
+            # $1=purge ("true" only on an explicit operator opt-in delete). Default: stop+disable
+            # keepalived and remove OUR config (VIP released) but KEEP the package. Purge only when
+            # opted in AND we installed it (.hom_installed marker) — never an admin's package.
+            local purge="${1:-false}" marker_inst; marker_inst="$(dirname "$conf")/.hom_installed"
+            log "INFO" "KEEPALIVED: tearing down our managed VIP config (purge=$purge)"
+            systemctl stop keepalived >/dev/null 2>&1
+            systemctl disable keepalived >/dev/null 2>&1
+            rm -f "$conf" "$chk"
+            if [[ "$purge" == "true" && -f "$marker_inst" ]]; then
+                log "INFO" "KEEPALIVED: uninstalling keepalived package (operator opt-in)"
+                if command -v apt-get >/dev/null 2>&1; then timeout 300 apt-get purge -y -qq keepalived >/dev/null 2>&1
+                elif command -v dnf >/dev/null 2>&1; then timeout 300 dnf remove -y -q keepalived >/dev/null 2>&1
+                elif command -v yum >/dev/null 2>&1; then timeout 300 yum remove -y -q keepalived >/dev/null 2>&1
+                elif command -v zypper >/dev/null 2>&1; then timeout 300 zypper --non-interactive remove -y keepalived >/dev/null 2>&1
+                elif command -v apk >/dev/null 2>&1; then timeout 300 apk del keepalived >/dev/null 2>&1
+                fi
+                rm -f "$marker_inst"
+                if command -v keepalived >/dev/null 2>&1; then
+                    _kp_report "disabled" "" "" "config removed; package uninstall attempted (still present)"
+                else
+                    _kp_report "disabled" "" "" "torn down + keepalived package uninstalled"
+                fi
+            elif [[ "$purge" == "true" ]]; then
+                log "INFO" "KEEPALIVED: package was pre-existing (not installed by us) — left in place; our config removed"
+                _kp_report "disabled" "" "" "torn down (package left: pre-existing, not installed by us)"
+            else
+                _kp_report "disabled" "" "" "torn down"
+            fi
+        }
+
+        case "$status" in
+            available) : ;;
+            teardown)
+                local _kp_purge; _kp_purge=$(echo "$resp" | jq -r '.purge // false' 2>/dev/null)
+                [[ "$we_own" == "true" ]] && _kp_teardown "$_kp_purge"   # explicit delete: honor opt-in purge
+                return 0 ;;
+            not_configured)
+                [[ "$we_own" == "true" ]] && _kp_teardown "false"   # T-2 orphan self-heal: graceful only
+                return 0 ;;
+            *) return 0 ;;
+        esac
+
+        local vip_id new_conf check_script install_if new_hash
+        vip_id=$(echo "$resp" | jq -r '.keepalived.vip_id // empty' 2>/dev/null)
+        new_conf=$(echo "$resp" | jq -r '.keepalived.config_content // empty' 2>/dev/null)
+        new_hash=$(echo "$resp" | jq -r '.keepalived.config_hash // empty' 2>/dev/null)
+        check_script=$(echo "$resp" | jq -r '.keepalived.check_script // empty' 2>/dev/null)
+        install_if=$(echo "$resp" | jq -r '.keepalived.install_if_missing // false' 2>/dev/null)
+        [[ -z "$new_conf" ]] && return 0
+
+        if [[ -f "$conf" && "$we_own" != "true" ]]; then
+            log "WARN" "KEEPALIVED: $conf is externally managed — refusing to overwrite"
+            _kp_report "externally_managed" "$vip_id" "" "pre-existing unmanaged keepalived.conf"
+            return 0
+        fi
+
+        if ! command -v keepalived >/dev/null 2>&1; then
+            if [[ "$install_if" == "true" ]]; then
+                log "INFO" "KEEPALIVED: installing package..."
+                if command -v apt-get >/dev/null 2>&1; then timeout 300 apt-get install -y -qq keepalived >/dev/null 2>&1
+                elif command -v dnf >/dev/null 2>&1; then timeout 300 dnf install -y -q keepalived >/dev/null 2>&1
+                elif command -v yum >/dev/null 2>&1; then timeout 300 yum install -y -q keepalived >/dev/null 2>&1
+                elif command -v zypper >/dev/null 2>&1; then timeout 300 zypper --non-interactive install -y keepalived >/dev/null 2>&1
+                elif command -v apk >/dev/null 2>&1; then timeout 300 apk add --no-cache keepalived >/dev/null 2>&1
+                fi
+            fi
+            if ! command -v keepalived >/dev/null 2>&1; then
+                log "ERROR" "KEEPALIVED: not installed/available"
+                _kp_report "error" "$vip_id" "" "keepalived not installed"
+                return 0
+            fi
+            # We installed keepalived (it was missing) — drop a marker so an opt-in uninstall on
+            # delete removes only OUR install, never an admin's pre-existing keepalived package.
+            mkdir -p "$(dirname "$conf")" 2>/dev/null; : > "$(dirname "$conf")/.hom_installed" 2>/dev/null
+        fi
+
+        if [[ -f "$conf" ]]; then
+            local cur_hash would_hash
+            cur_hash=$(md5sum "$conf" 2>/dev/null | awk '{print $1}')
+            would_hash=$(printf '%s' "$new_conf" | md5sum 2>/dev/null | awk '{print $1}')
+            if [[ -n "$cur_hash" && "$cur_hash" == "$would_hash" ]]; then
+                return 0
+            fi
+        fi
+
+        mkdir -p "$(dirname "$conf")"
+        if [[ -n "$check_script" ]]; then
+            printf '%s' "$check_script" > "$chk"
+            chown root:root "$chk" 2>/dev/null
+            chmod 0755 "$chk"
+        fi
+        # Validate on a TEMP file and swap in only on success: a bad render must never land on
+        # $conf (it would also make the md5 idempotency guard above suppress retries forever).
+        local tmp_conf="${conf}.hom.tmp"
+        printf '%s' "$new_conf" > "$tmp_conf"
+        chmod 0644 "$tmp_conf"
+        if ! keepalived -t -f "$tmp_conf" >/dev/null 2>&1; then
+            rm -f "$tmp_conf"
+            log "ERROR" "KEEPALIVED: config validation failed (keepalived -t) — keeping current config, not (re)starting"
+            _kp_report "error" "$vip_id" "$new_hash" "keepalived -t failed"
+            return 0
+        fi
+        mv -f "$tmp_conf" "$conf"
+        chown root:root "$conf" 2>/dev/null
+        chmod 0644 "$conf"
+        systemctl enable keepalived >/dev/null 2>&1
+        if systemctl reload keepalived >/dev/null 2>&1 || systemctl restart keepalived >/dev/null 2>&1; then
+            log "INFO" "KEEPALIVED: applied config for VIP ${vip_id}"
+            _kp_report "enabled" "$vip_id" "$new_hash" "applied"
+        else
+            log "ERROR" "KEEPALIVED: reload/restart failed"
+            _kp_report "error" "$vip_id" "$new_hash" "reload/restart failed"
+        fi
+        return 0
+    }
+
     log "DEBUG" "DAEMON: Starting agent monitoring loop for $AGENT_NAME"
-    
+
     # Enhanced daemon loop with upgrade capability - EXACT MacOS COPY
     while true; do
         sleep 30
@@ -3208,6 +3537,13 @@ CONFIG_RESPONSE_EOF
             fi
         fi
         
+        # Issue #27 — HA/VIP (Keepalived) convergence at the SSL cadence (~2.5 min);
+        # inert for non-VIP nodes (status=not_configured + no ownership marker).
+        _kp_loop_count=$(( ${_kp_loop_count:-0} + 1 ))
+        if (( _kp_loop_count % 5 == 0 )) && type fetch_and_deploy_keepalived_config &>/dev/null; then
+            fetch_and_deploy_keepalived_config
+        fi
+
         # Check for configuration updates with proper error handling
         config_response=$(curl -k -s -X GET "$MANAGEMENT_URL/api/agents/$AGENT_NAME/config" \
             -H "X-API-Key: $CURRENT_AGENT_TOKEN" 2>/dev/null)

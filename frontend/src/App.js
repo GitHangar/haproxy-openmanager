@@ -5,6 +5,7 @@ import {
   DashboardOutlined,
   SettingOutlined,
   CloudServerOutlined,
+  DeploymentUnitOutlined,
   FileTextOutlined,
   GlobalOutlined,
   SafetyCertificateOutlined,
@@ -42,6 +43,7 @@ import PoolManagement from './components/PoolManagement';
 import Login from './components/Login';
 import ClusterSelector from './components/ClusterSelector';
 import ClusterManagement from './components/ClusterManagement';
+import VIPManagement from './components/VIPManagement';
 import Configuration from './components/Configuration';
 import APIDocumentation from './components/APIDocumentation';
 import IPInventory from './components/IPInventory';
@@ -155,6 +157,11 @@ const { Text } = Typography;
       key: '/clusters',
       icon: <CloudServerOutlined />,
       label: <Link to="/clusters">Clusters</Link>,
+    },
+    {
+      key: '/ha-vip',
+      icon: <DeploymentUnitOutlined />,
+      label: <Link to="/ha-vip">HA / VIP</Link>,
     },
     {
       key: '/pools',
@@ -466,6 +473,7 @@ function AppContent() {
               <Route path="/pools" element={<PoolManagement />} />
               <Route path="/settings" element={<Settings />} />
               <Route path="/clusters" element={<ClusterManagement />} />
+              <Route path="/ha-vip" element={<VIPManagement />} />
               <Route path="/ip-inventory" element={<IPInventory />} />
             </Routes>
           </Content>

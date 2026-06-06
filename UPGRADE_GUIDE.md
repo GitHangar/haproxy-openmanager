@@ -1,3 +1,31 @@
+# Upgrade Notes — v1.7.0 (HA / VIP Keepalived management, Issue #27)
+
+**Backward compatible & opt-in.** Upgrading to v1.7.0 changes nothing for existing
+clusters/agents until you create a VIP:
+
+- **Schema:** `SCHEMA_VERSION` bumps to `3`, so on first start the (idempotent)
+  migration sequence re-runs once and adds two **new** tables (`vip_instances`,
+  `vip_members`) plus an additive `vip_instances.applied_snapshot` column (enables
+  rejecting a pending VIP change and restoring the previous applied state). No existing
+  table is altered. Existing rows and the **admin password
+  are not reset** (default users are create-if-missing). The only data effect is that
+  the **four built-in system roles** (`super_admin`/`operator`/`security_admin`/`viewer`)
+  are re-seeded to their canonical permission sets **plus** the new `vip.*` permissions —
+  this is the long-standing behavior of the role seeder; **custom roles are untouched**.
+- **Agents:** the agent script gains an opt-in keepalived deploy that is a **no-op** on
+  any node without an applied VIP, and it **never overwrites a hand-managed
+  `/etc/keepalived/keepalived.conf`** (it reports "externally managed" instead).
+- **Scope:** VRRP VIPs target bare-metal / VMware / on-prem L2 networks. On AWS/Azure/GCP
+  the cloud fabric doesn't honor VRRP/gratuitous-ARP; the UI surfaces this. Ensure host
+  firewalls permit VRRP (IP protocol 112).
+- **Optional env:** `VIP_ENCRYPTION_KEY` (see `.env.template`) — if unset, the VRRP secret
+  encryption key is derived from `SECRET_KEY` (like MFA).
+
+No rollback steps are required to *disable* the feature: simply don't create VIPs (or
+delete them — agents tear down their managed keepalived on the next poll).
+
+---
+
 # Agent Upgrade Guide - Dashboard Stats Fix
 
 ## Problem

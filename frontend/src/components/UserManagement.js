@@ -147,6 +147,17 @@ const PERMISSION_TREE = [
     ]
   },
   {
+    title: '🛰️ HA / VIP Management',
+    key: 'vip',
+    children: [
+      { title: 'View VIPs', key: 'vip.read' },
+      { title: 'Create VIP', key: 'vip.create' },
+      { title: 'Edit VIP', key: 'vip.update' },
+      { title: 'Delete VIP', key: 'vip.delete' },
+      { title: 'Apply / Deploy VIP', key: 'vip.apply' }
+    ]
+  },
+  {
     title: '📝 Configuration',
     key: 'config',
     children: [

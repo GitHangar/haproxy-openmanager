@@ -37,6 +37,7 @@ const ApplyManagement = () => {
     backends: [],
     waf_rules: [],
     ssl_certificates: [],
+    vips: [],
     total_count: 0
   });
   const [configVersions, setConfigVersions] = useState([]);
@@ -53,6 +54,8 @@ const ApplyManagement = () => {
   // Validation Error Modal state
   const [validationErrorModalVisible, setValidationErrorModalVisible] = useState(false);
   const [selectedValidationError, setSelectedValidationError] = useState(null);
+  // HA/VIP (Issue #27): VIP changes appear in the standard right-panel "Pending Versions"
+  // (vip-* config_versions) and use the standard "View Change" diff — no bespoke VIP modal.
 
   // Initial load on component mount
   useEffect(() => {
@@ -67,7 +70,7 @@ const ApplyManagement = () => {
   useEffect(() => {
     if (selectedCluster) {
       // CRITICAL: Clear all state immediately when cluster changes to prevent cross-cluster contamination
-      setPendingChanges({ frontends: [], backends: [], waf_rules: [], ssl_certificates: [], total_count: 0 });
+      setPendingChanges({ frontends: [], backends: [], waf_rules: [], ssl_certificates: [], vips: [], total_count: 0 });
       setConfigVersions([]);
       setAgentSync(null);
       setEntitySyncStates({});
@@ -77,7 +80,7 @@ const ApplyManagement = () => {
       fetchConfigVersions();
       fetchAgentSync();
     } else {
-      setPendingChanges({ frontends: [], backends: [], waf_rules: [], ssl_certificates: [], total_count: 0 });
+      setPendingChanges({ frontends: [], backends: [], waf_rules: [], ssl_certificates: [], vips: [], total_count: 0 });
       setConfigVersions([]);
       setAgentSync(null);
       setEntitySyncStates({});
@@ -125,26 +128,32 @@ const ApplyManagement = () => {
         'Pragma': 'no-cache'
       };
       
-      const [frontendsRes, backendsRes, wafRes, sslRes] = await Promise.all([
-        axios.get('/api/frontends', { 
+      const [frontendsRes, backendsRes, wafRes, sslRes, vipsRes] = await Promise.all([
+        axios.get('/api/frontends', {
           params: { cluster_id: selectedCluster.id, include_inactive: true },
           headers: cacheHeaders
         }).catch(() => ({ data: { frontends: [] } })),
-        
-        axios.get('/api/backends', { 
+
+        axios.get('/api/backends', {
           params: { cluster_id: selectedCluster.id, include_inactive: true },
           headers: cacheHeaders
         }).catch(() => ({ data: { backends: [] } })),
-        
-        axios.get('/api/waf/rules', { 
+
+        axios.get('/api/waf/rules', {
           params: { cluster_id: selectedCluster.id },
           headers: cacheHeaders
         }).catch(() => ({ data: { rules: [] } })),
-        
-        axios.get('/api/ssl/certificates', { 
+
+        axios.get('/api/ssl/certificates', {
           params: { cluster_id: selectedCluster.id },
           headers: cacheHeaders
-        }).catch(() => ({ data: [] }))
+        }).catch(() => ({ data: [] })),
+
+        // HA/VIP (Issue #27): pool-scoped, fetched cluster-scoped so it lists like other entities
+        axios.get('/api/vip', {
+          params: { cluster_id: selectedCluster.id },
+          headers: cacheHeaders
+        }).catch(() => ({ data: { vips: [] } }))
       ]);
 
       // DEBUG: Log raw backend data
@@ -180,14 +189,17 @@ const ApplyManagement = () => {
       
       const waf_rules = (wafRes.data.rules || []).filter(w => w.has_pending_config);
       const ssl_certificates = (sslRes.data.ssl_certificates || sslRes.data || []).filter(s => s.has_pending_config);
+      // VIP "pending" is its last_config_status (no has_pending_config flag).
+      const vips = (vipsRes.data.vips || []).filter(v => v.last_config_status === 'PENDING');
 
-      const total_count = frontends.length + backends.length + waf_rules.length + ssl_certificates.length;
+      const total_count = frontends.length + backends.length + waf_rules.length + ssl_certificates.length + vips.length;
 
       setPendingChanges({
         frontends,
         backends,
         waf_rules,
         ssl_certificates,
+        vips,
         total_count
       });
 
@@ -370,6 +382,9 @@ const ApplyManagement = () => {
             {pendingChanges.ssl_certificates.length > 0 && (
               <li><strong>{pendingChanges.ssl_certificates.length}</strong> SSL certificate changes</li>
             )}
+            {(pendingChanges.vips || []).length > 0 && (
+              <li><strong>{pendingChanges.vips.length}</strong> HA/VIP changes</li>
+            )}
           </ul>
           <Alert
             message="All changes will be applied together and sent to agents"
@@ -385,6 +400,74 @@ const ApplyManagement = () => {
       width: 600,
       onOk: executeApplyAll
     });
+  };
+
+  // HA/VIP convergence tracking (Issue #27 follow-up). VIP teardown/deploy is asynchronous —
+  // member agents converge keepalived on their next poll. Mirror the HAProxy agent-sync widget
+  // so the progress popup keeps showing "Syncing HA/VIP... X/Y" until the nodes report the VIP
+  // ACTIVE, instead of flashing green while the HA/VIP page still shows SYNCING. Fire-and-forget
+  // recursive poll exactly like checkAgentSync (applyLoading is released immediately; this runs
+  // in the background and updates the floating widget). Bounded so an offline node can't poll
+  // forever — it then completes with an informational "still converging" note.
+  const trackVipConvergence = (clusterId, vipIds, startedAt) => {
+    const token = localStorage.getItem('token');
+    const total = vipIds.length;
+    const poll = async () => {
+      let vips = [];
+      try {
+        const r = await axios.get(`/api/vip?cluster_id=${clusterId}`, { headers: { Authorization: `Bearer ${token}` } });
+        vips = r.data.vips || [];
+      } catch (e) { /* transient — keep polling */ }
+      // A change has converged when the node reports the VIP ACTIVE (create/edit) OR the VIP is
+      // fully torn down (delete approval): deploy_status DELETED, or it has dropped off the list
+      // entirely once every member acked the teardown.
+      const isConverged = (vid) => {
+        const v = vips.find(x => x.id === vid);
+        if (!v) return true;                       // gone from the list → torn down / deleted
+        return v.deploy_status === 'ACTIVE' || v.deploy_status === 'DELETED';
+      };
+      const synced = vipIds.filter(isConverged).length;   // VIP-level (drives completion)
+      const errored = vips.filter(v => vipIds.includes(v.id)
+        && (v.deploy_status === 'ERROR' || v.deploy_status === 'ATTENTION')).length;
+      // Per-NODE progress: sum member acks across the tracked VIPs still present, so a multi-node
+      // VIP shows "1/2 node(s)" like the HA/VIP table — not just "1 change". Gone (torn-down) VIPs
+      // are already counted converged via isConverged.
+      let nodeTotal = 0, nodeSynced = 0;
+      for (const vid of vipIds) {
+        const v = vips.find(x => x.id === vid);
+        if (v) { nodeTotal += (v.deploy_total || 0); nodeSynced += (v.deploy_synced || 0); }
+      }
+      const label = nodeTotal > 0 ? `${nodeSynced}/${nodeTotal} node(s)` : `${synced}/${total} change(s)`;
+      const prog = Math.min(95, 60 + Math.round(35 * (nodeTotal > 0 ? nodeSynced / nodeTotal : synced / Math.max(1, total))));
+      updateEntityCounts(nodeTotal > 0 ? nodeSynced : synced, nodeTotal > 0 ? nodeTotal : total, 0, 0, 0);
+
+      if (synced === total) {
+        const msg = `${total} HA/VIP change(s) fully converged on all member node(s).`;
+        setSyncProgress({ visible: true, step: msg, progress: 100 });
+        completeProgress(msg);
+        setTimeout(() => { setSyncProgress({ visible: false, step: '', progress: 0 }); message.success(msg); }, 1500);
+        return;
+      }
+      if (errored > 0) {
+        const msg = 'HA/VIP applied, but a member node reported an issue — open Diagnostics on the HA / VIP page.';
+        setSyncProgress({ visible: true, step: msg, progress: 100 });
+        completeProgress(msg);
+        setTimeout(() => { setSyncProgress({ visible: false, step: '', progress: 0 }); message.warning(msg); }, 1800);
+        return;
+      }
+      if (Date.now() - startedAt > 300000) { // ~5 min cap (e.g. an offline member node)
+        const msg = `HA/VIP applied — ${label} converged; the rest are still converging (or a node's agent is offline). Track live status on the HA / VIP page.`;
+        setSyncProgress({ visible: true, step: msg, progress: 100 });
+        completeProgress(msg);
+        setTimeout(() => { setSyncProgress({ visible: false, step: '', progress: 0 }); message.info(msg); }, 2000);
+        return;
+      }
+      const step = `Syncing HA/VIP... ${label} converged (keepalived deploy can take a couple of minutes)`;
+      setSyncProgress({ visible: true, step, progress: prog });
+      updateProgress(step, prog, { 'Synced HA/VIP': label });
+      setTimeout(poll, 5000);
+    };
+    setTimeout(poll, 2000);
   };
 
   const executeApplyAll = async () => {
@@ -429,13 +512,28 @@ const ApplyManagement = () => {
       
       // Detect if this is a restore operation (safe display-only check)
       const pendingVersions = configVersions.filter(v => v.status === 'PENDING');
-      const isRestoreOperation = totalEntities === 0 && pendingVersions.some(v => v.version_name.startsWith('restore-'));
-      
+      // HA/VIP (Issue #27): vip-* versions are VIP-owned and excluded from the HAProxy apply
+      // (cluster.py). Ignore them when deciding whether this apply has any HAProxy/cluster
+      // work to track — otherwise a VIP-only apply (which now stages a vip-* version) would
+      // look like it has a pending version and the agent-sync tracker would hang on 0/0.
+      const nonVipPendingVersions = pendingVersions.filter(v => !(v.version_name || '').startsWith('vip-'));
+      const isRestoreOperation = totalEntities === 0 && nonVipPendingVersions.some(v => v.version_name.startsWith('restore-'));
+      // HA/VIP-only apply: no HAProxy entity or config-version goes through the cluster-sync
+      // pipeline, so complete promptly after the isolated VIP apply (member nodes converge
+      // async on their next agent poll) instead of looping on "Entities: 0/0".
+      const vipCount = (pendingChanges.vips || []).length;
+      const isVipOnly = totalEntities === 0 && !isRestoreOperation && nonVipPendingVersions.length === 0 && vipCount > 0;
+
       if (isRestoreOperation) {
         // Restore operation: Show "Configuration" instead of "Entities"
         setSyncProgress({ visible: true, step: `Applying configuration restore... Configuration: 0/1, Agents: ⏳`, progress: 20 });
         startProgress('apply', `Applying configuration restore... Configuration: 0/1, Agents: ⏳`);
         updateEntityCounts(0, 1, 0, totalAgents, disabledAgents); // Show 1 configuration item
+      } else if (isVipOnly) {
+        // HA/VIP-only: avoid the "Entities: 0/0" / agent-sync widget entirely.
+        setSyncProgress({ visible: true, step: `Applying ${vipCount} HA/VIP change(s)...`, progress: 20 });
+        startProgress('apply', `Applying ${vipCount} HA/VIP change(s)...`);
+        updateEntityCounts(0, vipCount, 0, 0, 0);
       } else {
         // Normal operation: Show "Entities" as usual
         setSyncProgress({ visible: true, step: `Applying configuration changes... Entities: 0/${totalEntities}, Agents: ⏳`, progress: 20 });
@@ -445,16 +543,59 @@ const ApplyManagement = () => {
     
     try {
       const token = localStorage.getItem('token');
-      
-      const response = await axios.post(
-        `/api/clusters/${selectedCluster.id}/apply-changes`,
-        {},
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      
+
+      // HA/VIP (Issue #27): apply pending VIPs first (isolated endpoint; safe no-op for
+      // HAProxy config). Done here so VIPs apply even when there are no HAProxy changes.
+      const pendingVips = pendingChanges.vips || [];
+      for (const vip of pendingVips) {
+        try {
+          await axios.post(`/api/vip/${vip.id}/apply`, {}, { headers: { Authorization: `Bearer ${token}` } });
+        } catch (vipErr) {
+          console.error(`[APPLY VIP ${vip.id}] failed:`, vipErr);
+          message.warning(`VIP "${vip.name}" apply failed: ${extractApiError(vipErr, 'error')}`);
+        }
+      }
+
+      // Apply HAProxy changes only if there are any (avoids a no-op call when only VIPs are pending).
+      const haproxyPending = pendingChanges.frontends.length + pendingChanges.backends.length
+        + pendingChanges.waf_rules.length + pendingChanges.ssl_certificates.length;
+      const response = haproxyPending > 0
+        ? await axios.post(
+            `/api/clusters/${selectedCluster.id}/apply-changes`,
+            {},
+            { headers: { Authorization: `Bearer ${token}` } }
+          )
+        : { data: { message: `Applied ${pendingVips.length} HA/VIP change(s)`, applied_count: pendingVips.length } };
+
       // CRITICAL DEBUG: Log apply response
       console.log('[APPLY ALL RESPONSE]:', response.data);
-      
+
+      // HA/VIP-only apply (Issue #27): nothing goes through the HAProxy config-version /
+      // cluster-sync pipeline, so the agent-sync tracker below would loop forever on
+      // "Entities: 0/0". The isolated VIP apply already staged each node's snapshot; member
+      // agents install/configure keepalived and converge on their next poll — live status
+      // shows on the HA / VIP page (PENDING → SYNCING → ACTIVE). Complete now (no flash).
+      if (haproxyPending === 0 && nonVipPendingVersions.length === 0) {
+        await fetchPendingChanges();
+        await fetchConfigVersions();
+        if (pendingVips.length > 0) {
+          // Keep the popup in a "Syncing HA/VIP... X/Y" state (like every other entity) until the
+          // member nodes report the VIP ACTIVE — instead of flashing green while the HA/VIP page
+          // still shows SYNCING. The poll runs in the background (finally{} releases applyLoading).
+          const step = `Applied — syncing HA/VIP... 0/${pendingVips.length} node(s) converged`;
+          updateEntityCounts(0, pendingVips.length, 0, 0, 0);
+          setSyncProgress({ visible: true, step, progress: 60 });
+          updateProgress(step, 60);
+          trackVipConvergence(selectedCluster.id, pendingVips.map(v => v.id), Date.now());
+        } else {
+          const vmsg = 'Changes applied.';
+          setSyncProgress({ visible: true, step: vmsg, progress: 100 });
+          completeProgress(vmsg);
+          setTimeout(() => { setSyncProgress({ visible: false, step: '', progress: 0 }); message.success(vmsg); }, 1500);
+        }
+        return; // finally{} resets applyLoading; the VIP poll runs in the background (like checkAgentSync)
+      }
+
       setSyncProgress({ visible: true, step: `Configuration applied, syncing agents... Entities: ${totalEntities}/${totalEntities}, Agents: 0/${totalAgents}`, progress: 60 });
       updateProgress(`Configuration applied, syncing agents... Entities: ${totalEntities}/${totalEntities}, Agents: 0/${totalAgents}`, 60);
       updateEntityCounts(totalEntities, totalEntities, 0, totalAgents, disabledAgents);
@@ -678,6 +819,9 @@ const ApplyManagement = () => {
             {pendingChanges.ssl_certificates.length > 0 && (
               <li><strong>{pendingChanges.ssl_certificates.length}</strong> SSL certificate changes</li>
             )}
+            {(pendingChanges.vips || []).length > 0 && (
+              <li><strong>{pendingChanges.vips.length}</strong> HA/VIP changes</li>
+            )}
           </ul>
           <Alert
             message="All pending changes will be permanently discarded"
@@ -718,12 +862,28 @@ const ApplyManagement = () => {
     
     try {
       const token = localStorage.getItem('token');
-      
-      const response = await axios.delete(
-        `/api/clusters/${selectedCluster.id}/pending-changes`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      
+
+      // HA/VIP (Issue #27): reject pending VIPs (isolated endpoint; restores last applied state).
+      const pendingVips = pendingChanges.vips || [];
+      for (const vip of pendingVips) {
+        try {
+          await axios.post(`/api/vip/${vip.id}/reject`, {}, { headers: { Authorization: `Bearer ${token}` } });
+        } catch (vipErr) {
+          console.error(`[REJECT VIP ${vip.id}] failed:`, vipErr);
+          message.warning(`VIP "${vip.name}" reject failed: ${extractApiError(vipErr, 'error')}`);
+        }
+      }
+
+      // Reject HAProxy changes only if there are any.
+      const haproxyPending = pendingChanges.frontends.length + pendingChanges.backends.length
+        + pendingChanges.waf_rules.length + pendingChanges.ssl_certificates.length;
+      const response = haproxyPending > 0
+        ? await axios.delete(
+            `/api/clusters/${selectedCluster.id}/pending-changes`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          )
+        : { data: { message: `Rejected ${pendingVips.length} HA/VIP change(s)` } };
+
       // CRITICAL DEBUG: Log reject response
       console.log('[REJECT ALL RESPONSE]:', response.data);
       
@@ -1133,7 +1293,28 @@ const ApplyManagement = () => {
                     </div>
                   )}
 
-                  {pendingChanges.frontends.length === 0 && pendingChanges.backends.length === 0 && pendingChanges.waf_rules.length === 0 && pendingChanges.ssl_certificates.length === 0 && pendingVersions.length > 0 && (
+                  {/* HA/VIP Changes (Issue #27) */}
+                  {(pendingChanges.vips || []).length > 0 && (
+                    <div style={{ marginBottom: 16 }}>
+                      <Title level={5}>
+                        <CloudServerOutlined style={{ marginRight: 8, color: '#13c2c2' }} />
+                        HA / VIP Changes ({pendingChanges.vips.length})
+                      </Title>
+                      {pendingChanges.vips.map(item => (
+                        <div key={`vip-${item.id}`} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', marginBottom: 6, border: item.pending_delete ? '1px solid #ffccc7' : '1px solid #f0f0f0', borderRadius: 6, background: item.pending_delete ? '#fff1f0' : undefined }}>
+                          <CloudServerOutlined style={{ color: item.pending_delete ? '#cf1322' : '#13c2c2' }} />
+                          <span style={{ fontWeight: 500 }}>{item.name}</span>
+                          <Tag>{item.virtual_ip}/{item.prefix_length}</Tag>
+                          {item.pool_name && <Tag color="blue">{item.pool_name}</Tag>}
+                          {item.pending_delete
+                            ? <Tag color="red">DELETION — approve to tear down, reject to keep</Tag>
+                            : <Tag color="orange">PENDING</Tag>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {pendingChanges.frontends.length === 0 && pendingChanges.backends.length === 0 && pendingChanges.waf_rules.length === 0 && pendingChanges.ssl_certificates.length === 0 && (pendingChanges.vips || []).length === 0 && pendingVersions.length > 0 && (
                     <div style={{ marginTop: 8 }}>
                       {(() => {
                         const restoreVersions = pendingVersions.filter(v => v.version_name.startsWith('restore-'));
@@ -1401,6 +1582,10 @@ const ApplyManagement = () => {
                                     confusing error post-click. */}
                                 {(() => {
                                   const vn = version?.version_name || '';
+                                  // vip-* versions ARE undoable (Issue #27): the VIP router
+                                  // re-stages the rejected change as PENDING (reactivating a
+                                  // rejected create, or re-applying a rejected edit), so they
+                                  // use the normal Undo button below — not this disabled case.
                                   const destructive = (
                                     vn.startsWith('bulk-site-create-')
                                     || vn.startsWith('bulk-import-')

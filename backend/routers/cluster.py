@@ -292,12 +292,14 @@ async def create_cluster(cluster: HAProxyClusterCreate, authorization: str = Hea
         
         # Create cluster
         cluster_id = await conn.fetchval("""
-            INSERT INTO haproxy_clusters (name, description, connection_type, is_active, 
-                                        stats_socket_path, haproxy_config_path, haproxy_bin_path, pool_id)
-            VALUES ($1, $2, $3, TRUE, $4, $5, $6, $7)
+            INSERT INTO haproxy_clusters (name, description, connection_type, is_active,
+                                        stats_socket_path, haproxy_config_path, haproxy_bin_path,
+                                        keepalived_config_path, pool_id)
+            VALUES ($1, $2, $3, TRUE, $4, $5, $6, $7, $8)
             RETURNING id
         """, cluster.name, cluster.description, cluster.connection_type,
-            cluster.stats_socket_path, cluster.haproxy_config_path, cluster.haproxy_bin_path, cluster.pool_id)
+            cluster.stats_socket_path, cluster.haproxy_config_path, cluster.haproxy_bin_path,
+            cluster.keepalived_config_path, cluster.pool_id)
         
         await close_database_connection(conn)
         
@@ -436,7 +438,12 @@ async def update_cluster(cluster_id: int, cluster: HAProxyClusterUpdate, authori
             update_fields.append(f"haproxy_bin_path = ${param_counter}")
             update_values.append(cluster.haproxy_bin_path)
             param_counter += 1
-            
+
+        if cluster.keepalived_config_path is not None:
+            update_fields.append(f"keepalived_config_path = ${param_counter}")
+            update_values.append(cluster.keepalived_config_path)
+            param_counter += 1
+
         if cluster.pool_id is not None:
             update_fields.append(f"pool_id = ${param_counter}")
             update_values.append(cluster.pool_id)
@@ -579,8 +586,9 @@ async def get_cluster(cluster_id: int, authorization: str = Header(None), x_api_
         conn = await get_database_connection()
         
         cluster = await conn.fetchrow("""
-            SELECT c.id, c.name, c.description, c.connection_type, c.is_active, 
+            SELECT c.id, c.name, c.description, c.connection_type, c.is_active,
                    c.created_at, c.stats_socket_path, c.haproxy_config_path, c.haproxy_bin_path,
+                   c.keepalived_config_path,
                    c.pool_id, c.is_default, c.acme_enabled, c.acme_backend_url,
                    p.name as pool_name
             FROM haproxy_clusters c
@@ -604,6 +612,7 @@ async def get_cluster(cluster_id: int, authorization: str = Header(None), x_api_
             "stats_socket_path": cluster["stats_socket_path"],
             "haproxy_config_path": cluster["haproxy_config_path"],
             "haproxy_bin_path": cluster["haproxy_bin_path"],
+            "keepalived_config_path": cluster.get("keepalived_config_path"),
             "pool_id": cluster["pool_id"],
             "pool_name": cluster["pool_name"],
             "acme_enabled": cluster.get("acme_enabled", False),
@@ -704,8 +713,9 @@ async def get_clusters(authorization: str = Header(None), x_api_key: Optional[st
         conn = await get_database_connection()
         
         clusters = await conn.fetch("""
-            SELECT c.id, c.name, c.description, c.connection_type, c.is_active, 
+            SELECT c.id, c.name, c.description, c.connection_type, c.is_active,
                    c.created_at, c.stats_socket_path, c.haproxy_config_path, c.haproxy_bin_path,
+                   c.keepalived_config_path,
                    c.pool_id, c.is_default, c.acme_enabled, c.acme_backend_url,
                    p.name as pool_name,
                    COALESCE(agent_counts.total_agents, 0) as total_agents,
@@ -764,6 +774,7 @@ async def get_clusters(authorization: str = Header(None), x_api_key: Optional[st
                 "stats_socket_path": cluster["stats_socket_path"],
                 "haproxy_config_path": cluster["haproxy_config_path"],
                 "haproxy_bin_path": cluster["haproxy_bin_path"],
+                "keepalived_config_path": cluster.get("keepalived_config_path"),
                 "pool_id": cluster["pool_id"],
                 "pool_name": cluster["pool_name"],
                 "acme_enabled": cluster.get("acme_enabled", False),
@@ -1340,6 +1351,8 @@ async def list_cluster_config_versions(cluster_id: int, authorization: str = Hea
                 version_type = "WAF Rule"
             elif "ssl-" in version['version_name']:
                 version_type = "SSL Certificate"
+            elif "vip-" in version['version_name']:
+                version_type = "HA / VIP"
             
             # Parse validation error if present
             validation_error = version.get("validation_error")
@@ -1444,10 +1457,14 @@ async def apply_pending_changes(
         # Users will handle configuration completeness through the centralized Apply Management page
         
         # Get all pending config versions for this cluster
+        # HA/VIP (Issue #27): vip-* versions are owned by the VIP apply/reject endpoints
+        # (keepalived is not part of haproxy.cfg). Exclude them so a generic cluster apply
+        # from any entity page never marks a VIP version APPLIED without enacting it. This
+        # is a no-op for every non-VIP cluster (no vip-* rows exist).
         pending_versions = await conn.fetch("""
             SELECT id, version_name, created_at, config_content, checksum, metadata
-            FROM config_versions 
-            WHERE cluster_id = $1 AND status = 'PENDING'
+            FROM config_versions
+            WHERE cluster_id = $1 AND status = 'PENDING' AND version_name NOT LIKE 'vip-%'
             ORDER BY created_at ASC
         """, cluster_id)
         
@@ -2566,6 +2583,92 @@ async def get_config_version_diff(cluster_id: int, version_id: int, authorizatio
                     }
                 }
         
+        # HA/VIP (Issue #27): vip-{id}-{action} versions show the generated keepalived.conf
+        # each member node will deploy as the change content (VRRP secret masked). Mirrors
+        # the ssl-* special case above so VIP uses the STANDARD View Change diff modal.
+        vip_match = re.search(r'vip-(\d+)-(create|update|delete)', current_version['version_name'])
+        if vip_match:
+            vip_id = int(vip_match.group(1))
+            vip_action = vip_match.group(2)
+            rendered, vip_meta = None, None
+            old_content = ""
+            try:
+                from routers.vip import render_vip_config_masked
+                rendered, vip_meta = await render_vip_config_masked(conn, vip_id)
+                # For a create/update diff, fetch the PREVIOUS applied vip-* config for this VIP
+                # (the last-deployed keepalived.conf) so an EDIT shows ONLY the changed lines
+                # instead of the whole config as "added". Both sides are already secret-masked.
+                if vip_action != "delete":
+                    prev_applied = await conn.fetchrow(
+                        "SELECT config_content FROM config_versions WHERE version_name LIKE $1 "
+                        "AND status='APPLIED' AND cluster_id=$2 AND id < $3 ORDER BY id DESC LIMIT 1",
+                        f"vip-{vip_id}-%", cluster_id, current_version['id'])
+                    if prev_applied and prev_applied['config_content']:
+                        old_content = prev_applied['config_content']
+            except Exception as vip_err:
+                logger.warning(f"VIP DIFF: render failed for vip {vip_id}: {vip_err}")
+            await close_database_connection(conn)
+
+            changes = []
+            line_number = 1
+            if vip_action == "delete" or rendered is None:
+                title = (vip_meta or {}).get("name") or f"VIP {vip_id}"
+                for line in [f"# HA/VIP change: {title}",
+                             "# keepalived will be stopped and the virtual IP released on each member node."
+                             if vip_action == "delete" else
+                             "# (configuration is not available to render yet)"]:
+                    changes.append({"type": "context", "line": line, "line_number": line_number})
+                    line_number += 1
+                summary = {"added": 0, "removed": 1 if vip_action == "delete" else 0,
+                           "total_changes": 1 if vip_action == "delete" else 0}
+            else:
+                # Real line diff. Match the STANDARD haproxy diff format: the line is stored
+                # WITHOUT a +/- prefix (the UI adds it from `type` — the old `+ {line}` here
+                # caused the doubled "+ +"). A CREATE (no previous applied config) shows
+                # everything as added; an UPDATE shows ONLY the lines that actually changed.
+                import difflib
+                new_content = current_version['config_content'] or rendered or ""
+                added_count = 0
+                removed_count = 0
+                line_number = 0
+                if not old_content:
+                    for i, l in enumerate(new_content.split('\n')):
+                        changes.append({"type": "added", "line": l, "line_number": i + 1})
+                        added_count += 1
+                else:
+                    for dl in difflib.unified_diff(old_content.split('\n'), new_content.split('\n'),
+                                                   lineterm='', n=3):
+                        if dl.startswith('@@'):
+                            mm = re.search(r'@@ -(\d+),?\d* \+(\d+),?\d* @@', dl)
+                            if mm:
+                                line_number = int(mm.group(2))
+                            continue
+                        if dl.startswith('---') or dl.startswith('+++'):
+                            continue
+                        if dl.startswith('+'):
+                            changes.append({"type": "added", "line": dl[1:], "line_number": line_number})
+                            added_count += 1
+                            line_number += 1
+                        elif dl.startswith('-'):
+                            changes.append({"type": "removed", "line": dl[1:], "line_number": line_number})
+                            removed_count += 1
+                        elif dl.startswith(' '):
+                            changes.append({"type": "context", "line": dl[1:], "line_number": line_number})
+                            line_number += 1
+                summary = {"added": added_count, "removed": removed_count,
+                           "total_changes": added_count + removed_count}
+
+            return {
+                "current_version": {
+                    "id": current_version['id'],
+                    "version_name": current_version['version_name'],
+                    "created_at": current_version['created_at'].isoformat().replace('+00:00', 'Z')
+                },
+                "previous_version": None,
+                "changes": changes,
+                "summary": summary,
+            }
+
         # Check if current version has config content
         if not current_version['config_content']:
             # Special handling for restore versions - they might not have content yet
@@ -4253,6 +4356,20 @@ async def undo_reject_config_version(
                 ),
             )
 
+        # HA/VIP (Issue #27): vip-* versions are owned by the VIP entity, so undo is handled
+        # by the VIP router — it re-stages the rejected change as PENDING from the version's
+        # captured pending_state (reactivating the VIP if a rejected create soft-deleted it,
+        # or re-applying a rejected edit). Returns an error string if it can't (e.g. the
+        # name/address/VRID was reused since reject) -> surface a clean 409.
+        if version_name.startswith('vip-'):
+            from routers.vip import restore_vip_from_rejected_version
+            err = await restore_vip_from_rejected_version(conn, version_id)
+            await close_database_connection(conn)
+            if err:
+                raise HTTPException(status_code=409, detail=f"Cannot undo this VIP change — {err}.")
+            return {"message": "VIP change restored to PENDING — review and Apply it from Apply Management",
+                    "version_name": version_name}
+
         async with conn.transaction():
             # Mark the version as PENDING again
             await conn.execute("""
@@ -4929,9 +5046,11 @@ async def reject_all_pending_changes(cluster_id: int, authorization: str = Heade
         await validate_user_cluster_access(current_user['id'], cluster_id, conn)
 
         # Get all pending config versions for this cluster (CRITICAL: Include metadata for rollback!)
+        # HA/VIP (Issue #27): exclude vip-* versions — they are rejected/reverted by the
+        # VIP reject endpoint (which restores keepalived state), not the generic rollback.
         pending_versions = await conn.fetch("""
             SELECT id, version_name, metadata FROM config_versions
-            WHERE cluster_id = $1 AND status = 'PENDING'
+            WHERE cluster_id = $1 AND status = 'PENDING' AND version_name NOT LIKE 'vip-%'
         """, cluster_id)
         
         # CRITICAL FIX: Detect and clean orphan config versions
@@ -5143,11 +5262,12 @@ async def reject_all_pending_changes(cluster_id: int, authorization: str = Heade
         )
         
         # Mark all pending config versions as REJECTED (don't delete them)
+        # HA/VIP (Issue #27): leave vip-* versions to the VIP reject endpoint.
         rejected_count = len(pending_versions)
         await conn.execute("""
-            UPDATE config_versions 
+            UPDATE config_versions
             SET status = 'REJECTED'
-            WHERE cluster_id = $1 AND status = 'PENDING'
+            WHERE cluster_id = $1 AND status = 'PENDING' AND version_name NOT LIKE 'vip-%'
         """, cluster_id)
 
         # Update WAF rules status to APPLIED (rolled back)

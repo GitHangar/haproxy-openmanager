@@ -8,7 +8,7 @@ import redis
 import asyncio
 from datetime import datetime, timedelta
 
-_version_info = {"version": "1.6.5", "releaseName": "nginx security update (poolslip advisory)", "releaseDate": "2026-06-02"}
+_version_info = {"version": "1.7.8", "releaseName": "HA/VIP — per-node apply progress", "releaseDate": "2026-06-07"}
 for _vpath in ["/app/version.json", os.path.join(os.path.dirname(__file__), "..", "version.json")]:
     try:
         with open(_vpath) as _vf:
@@ -41,6 +41,7 @@ from routers.letsencrypt import router as letsencrypt_router
 from routers.acme_diagnostics import router as acme_diagnostics_router
 from routers.site_wizard import router as site_wizard_router
 from routers.mfa import router as mfa_router
+from routers.vip import router as vip_router  # Issue #27 — HA/VIP (Keepalived) management
 
 # Production logging configuration
 from utils.logging_config import setup_production_logging
@@ -836,6 +837,7 @@ app.include_router(settings_router)
 app.include_router(letsencrypt_router)
 app.include_router(acme_diagnostics_router)  # v1.5.0 Issue #13: ACME Diagnostic Panel
 app.include_router(site_wizard_router)  # v1.5.0 Issue #14: New Site Setup Wizard
+app.include_router(vip_router)  # v1.7.0 Issue #27: HA/VIP (Keepalived) management
 
 
 # Legacy URL alias: /api/proxied-hosts/* → 308 redirect to /api/sites/*.

@@ -1164,6 +1164,27 @@ get_keepalive_state() {
     return 0
 }
 
+# Issue #27 — keepalived/VRRP is Linux-only. macOS agents cannot run keepalived, so they
+# can never be VIP members (the backend also withholds the keepalived_management capability,
+# so the UI warns at assign time). This is a safe no-op that, if a VIP is somehow mis-assigned
+# to a macOS node, reports a clear "unsupported on macOS" status instead of silently never
+# converging. It never installs/writes anything.
+fetch_and_deploy_keepalived_config() {
+    local resp status vip_id
+    resp=$(curl -k -s -X GET "$MANAGEMENT_URL/api/agents/$AGENT_NAME/keepalived-config" \
+        -H "X-API-Key: $AGENT_TOKEN" 2>/dev/null) || return 0
+    [[ -z "$resp" ]] && return 0
+    status=$(echo "$resp" | jq -r '.status // "unknown"' 2>/dev/null)
+    if [[ "$status" == "available" ]]; then
+        vip_id=$(echo "$resp" | jq -r '.keepalived.vip_id // empty' 2>/dev/null)
+        log "WARN" "KEEPALIVED: a VIP is assigned to this node, but keepalived/VRRP is not supported on macOS — ignoring"
+        curl -k -s -X POST "$MANAGEMENT_URL/api/agents/$AGENT_NAME/keepalived-status" \
+            -H "X-API-Key: $AGENT_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"vip_id\":${vip_id:-null},\"state\":\"error\",\"message\":\"keepalived/VRRP not supported on macOS\"}" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 # Send heartbeat
 send_heartbeat() {
     local haproxy_status=$(get_haproxy_status)
@@ -2197,8 +2218,12 @@ run_daemon() {
         _loop_count=$((_loop_count + 1))
         if (( _loop_count % 5 == 0 )); then
             check_ssl_updates
+            # Issue #27 — HA/VIP convergence (no-op on macOS; reports unsupported if assigned)
+            if type fetch_and_deploy_keepalived_config &>/dev/null; then
+                fetch_and_deploy_keepalived_config
+            fi
         fi
-        
+
         check_agent_upgrade
     done
     
@@ -2629,7 +2654,25 @@ SYSTEM_INFO_EOF
         echo "|"
         return 0
     }
-    
+
+    # Issue #27 — keepalived/VRRP is Linux-only (DAEMON version). Safe no-op that reports a
+    # clear "unsupported on macOS" status if a VIP is ever mis-assigned to a macOS node.
+    fetch_and_deploy_keepalived_config() {
+        local resp status vip_id
+        resp=$(curl -k -s -X GET "$MANAGEMENT_URL/api/agents/$AGENT_NAME/keepalived-config" \
+            -H "X-API-Key: $AGENT_TOKEN" 2>/dev/null) || return 0
+        [[ -z "$resp" ]] && return 0
+        status=$(echo "$resp" | jq -r '.status // "unknown"' 2>/dev/null)
+        if [[ "$status" == "available" ]]; then
+            vip_id=$(echo "$resp" | jq -r '.keepalived.vip_id // empty' 2>/dev/null)
+            log "WARN" "KEEPALIVED: a VIP is assigned to this node, but keepalived/VRRP is not supported on macOS — ignoring"
+            curl -k -s -X POST "$MANAGEMENT_URL/api/agents/$AGENT_NAME/keepalived-status" \
+                -H "X-API-Key: $AGENT_TOKEN" -H "Content-Type: application/json" \
+                -d "{\"vip_id\":${vip_id:-null},\"state\":\"error\",\"message\":\"keepalived/VRRP not supported on macOS\"}" >/dev/null 2>&1 || true
+        fi
+        return 0
+    }
+
     # Send heartbeat (DAEMON version - includes all stats)
     send_heartbeat() {
         local haproxy_status=$(get_haproxy_status)
@@ -3021,6 +3064,13 @@ CONFIG_RESPONSE_EOF
             fi
         fi
         
+        # Issue #27 — HA/VIP convergence at the SSL cadence (no-op on macOS; reports
+        # unsupported if a VIP is mis-assigned to this node).
+        _kp_loop_count=$(( ${_kp_loop_count:-0} + 1 ))
+        if (( _kp_loop_count % 5 == 0 )) && type fetch_and_deploy_keepalived_config &>/dev/null; then
+            fetch_and_deploy_keepalived_config
+        fi
+
         # Check for configuration updates with proper error handling
         config_response=$(curl -k -s -X GET "$MANAGEMENT_URL/api/agents/$AGENT_NAME/config" \
             -H "X-API-Key: $CURRENT_AGENT_TOKEN" 2>/dev/null)

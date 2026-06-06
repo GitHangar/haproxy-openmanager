@@ -156,6 +156,7 @@ const ClusterManagement = () => {
       stats_socket_path: cluster.stats_socket_path || '/run/haproxy/admin.sock',
       haproxy_config_path: cluster.haproxy_config_path || '/etc/haproxy/haproxy.cfg',
       haproxy_bin_path: cluster.haproxy_bin_path,
+      keepalived_config_path: cluster.keepalived_config_path || '/etc/keepalived/keepalived.conf',
       agent_pool_id: cluster.pool_id || undefined,
       haproxy_user: cluster.haproxy_user || '',
       haproxy_group: cluster.haproxy_group || '',
@@ -197,6 +198,7 @@ const ClusterManagement = () => {
         stats_socket_path: values.stats_socket_path,
         haproxy_config_path: values.haproxy_config_path,
         haproxy_bin_path: values.haproxy_bin_path,
+        keepalived_config_path: values.keepalived_config_path,
         pool_id: values.agent_pool_id || null,
         haproxy_user: values.haproxy_user || null,
         haproxy_group: values.haproxy_group || null,
@@ -746,6 +748,14 @@ const ClusterManagement = () => {
             tooltip="HAProxy binary executable path - used for config validation and service management"
           >
             <Input placeholder="/usr/sbin/haproxy" />
+          </Form.Item>
+
+          <Form.Item
+            label="Keepalived Config Path"
+            name="keepalived_config_path"
+            tooltip="Where the agent writes keepalived.conf for this cluster's HA/VIPs. The default (/etc/keepalived/keepalived.conf) is what the keepalived service loads on every distro — leave it unless you run a non-standard install AND have configured the keepalived service/unit to load this exact path."
+          >
+            <Input placeholder="/etc/keepalived/keepalived.conf" />
           </Form.Item>
 
           <Form.Item

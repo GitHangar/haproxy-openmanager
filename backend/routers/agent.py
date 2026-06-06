@@ -862,7 +862,25 @@ async def delete_agent(agent_id: int, authorization: str = Header(None)):
         # Validate cluster access if agent belongs to a cluster
         if agent['cluster_id']:
             await validate_user_cluster_access(current_user['id'], agent['cluster_id'], conn)
-        
+
+        # HA/VIP (Issue #27): block deleting a node that's still a member of an active VIP.
+        # Otherwise the CASCADE would silently drop it from the VIP (breaking the one-MASTER
+        # topology with no signal) and the still-running node would keep advertising the VIP
+        # with no way to be told to tear down (review MED-3). Make the operator remove it
+        # from the VIP first — that stages a clean PENDING change they can apply.
+        try:
+            vip_member = await conn.fetchrow(
+                "SELECT v.name FROM vip_members vm JOIN vip_instances v ON v.id = vm.vip_id "
+                "WHERE vm.agent_id = $1 AND v.is_active = TRUE LIMIT 1", agent_id)
+        except Exception:  # noqa: BLE001 — vip_* may not exist on older schemas; don't block delete
+            vip_member = None
+        if vip_member:
+            await close_database_connection(conn)
+            raise HTTPException(
+                status_code=409,
+                detail=(f"This node is a member of VIP '{vip_member['name']}'. Remove it from the "
+                        f"VIP on the HA / VIP page (and apply) before deleting the agent."))
+
         await conn.execute("DELETE FROM agents WHERE id = $1", agent_id)
         
         await close_database_connection(conn)
@@ -1750,9 +1768,14 @@ async def agent_heartbeat_by_name(
             heartbeat_data.operating_system, heartbeat_data.kernel_version,
             heartbeat_data.uptime, heartbeat_data.cpu_count, heartbeat_data.memory_total,
             heartbeat_data.disk_space, 
-            # Convert lists to JSON for JSONB columns
-            heartbeat_data.network_interfaces if isinstance(heartbeat_data.network_interfaces, str) else json.dumps(heartbeat_data.network_interfaces or []),
-            heartbeat_data.capabilities if isinstance(heartbeat_data.capabilities, str) else json.dumps(heartbeat_data.capabilities or []),
+            # Convert lists to JSON for JSONB columns. Don't WIPE network_interfaces/capabilities
+            # when a heartbeat omits them: send NULL so COALESCE keeps the existing value (a bare
+            # `or []` would store "[]" and erase the reported NICs / keepalived_management on every
+            # daemon heartbeat that doesn't include them — issue #27 corporate test).
+            (heartbeat_data.network_interfaces if isinstance(heartbeat_data.network_interfaces, str)
+             else (json.dumps(heartbeat_data.network_interfaces) if heartbeat_data.network_interfaces else None)),
+            (heartbeat_data.capabilities if isinstance(heartbeat_data.capabilities, str)
+             else (json.dumps(heartbeat_data.capabilities) if heartbeat_data.capabilities else None)),
             agent_ip, heartbeat_data.haproxy_status, heartbeat_data.haproxy_version,
             heartbeat_data.applied_config_version, new_status, update_applied_version,
             heartbeat_data.keepalive_state, heartbeat_data.keepalive_ip)
@@ -2181,12 +2204,170 @@ async def get_agent_ssl_certificates(agent_name: str, since: Optional[str] = Non
             logger.info(f"SSL INCREMENTAL: No certificates updated since {since}")
             
         return response_data
-        
+
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"SSL certificates retrieval failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{agent_name}/keepalived-config")
+async def get_agent_keepalived_config(agent_name: str, x_api_key: Optional[str] = Header(None)):
+    """Issue #27 (v1.7.0) — deliver this agent's APPLIED keepalived snapshot, or a
+    teardown / no-op signal.
+
+    Snapshot-based (T-1): keys off vip_instances.is_active + the member's
+    applied_config_content, NOT the live last_config_status — so a PENDING edit never
+    flips a running member to not_configured (no mid-edit teardown). Auth is MANDATORY (a
+    valid agent key is required), but — like the /config and /ssl-certificates endpoints —
+    the agent API key is a SHARED/global install token, so the config is resolved by the
+    requested agent_name and a token/name mismatch is an advisory audit log, NOT a 403
+    (a hard 403 would break every VIP member whose name isn't the one row the shared token
+    resolves to — review HIGH-1). Any unexpected error degrades to not_configured (B-7) so
+    the agent stays inert; a node with no membership row always gets not_configured.
+    """
+    conn = None
+    try:
+        # Auth FIRST and MANDATORY: a valid agent key is REQUIRED (the response carries the
+        # VRRP secret). The token is shared/global, so resolve by agent_name and only LOG a
+        # name mismatch — do not 403 (HIGH-1). Done before the agent lookup so an
+        # unauthenticated caller can't probe which agent names exist.
+        from auth_middleware import validate_agent_api_key
+        if not x_api_key:
+            raise HTTPException(status_code=401, detail="Agent API key required")
+        agent_auth = await validate_agent_api_key(x_api_key)
+        if not agent_auth:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        # The agent API key is a SHARED/global install token (many agent rows per token),
+        # so validate_agent_api_key resolves it to one arbitrary agent for that token. Resolve
+        # the keepalived config strictly by the requested agent_name and treat a token/name
+        # mismatch as an advisory audit log — exactly like the /config and /ssl-certificates
+        # endpoints. (A hard 403 here would reject every VIP member whose name isn't the one
+        # row the shared token happens to return, so the VIP could never converge — review HIGH-1.)
+        if agent_auth['name'] == agent_name:
+            logger.info(f"Agent '{agent_name}' fetching keepalived config using its own API key")
+        else:
+            logger.info(f"Agent '{agent_name}' fetching keepalived config using API key from agent '{agent_auth['name']}'")
+
+        conn = await get_database_connection()
+        # Resolve the agent + its cluster's keepalived.conf path (cluster-driven, like the
+        # HAProxy paths). config_path is returned in EVERY response so the agent knows where
+        # to write/own-marker-check even on not_configured/teardown.
+        agent = await conn.fetchrow("""
+            SELECT a.id, a.name, COALESCE(a.enabled, TRUE) AS enabled,
+                   hc.keepalived_config_path
+            FROM agents a
+            LEFT JOIN haproxy_clusters hc ON hc.pool_id = a.pool_id
+            WHERE a.name = $1
+        """, agent_name)
+        if not agent:
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
+        config_path = agent['keepalived_config_path'] or '/etc/keepalived/keepalived.conf'
+        if not agent['enabled']:
+            return {"agent_name": agent_name, "status": "not_configured", "config_path": config_path, "keepalived": None}
+
+        row = await conn.fetchrow("""
+            SELECT v.id AS vip_id, v.name AS vip_name, v.is_active, v.track_haproxy,
+                   v.purge_on_teardown,
+                   m.applied_config_content, m.applied_config_hash
+            FROM vip_members m JOIN vip_instances v ON v.id = m.vip_id
+            WHERE m.agent_id = $1
+            -- Active VIP first (an agent has at most one). With NO active VIP, pick the most
+            -- RECENTLY updated inactive membership so a teardown reflects the latest delete
+            -- (incl. its purge flag) — not a stale older VIP the node was once part of.
+            ORDER BY v.is_active DESC, v.updated_at DESC, v.id DESC
+            LIMIT 1
+        """, agent['id'])
+
+        if not row:
+            return {"agent_name": agent_name, "status": "not_configured", "config_path": config_path, "keepalived": None}
+        if not row['is_active']:
+            # Soft-deleted VIP → teardown. purge carries the operator's opt-in package removal;
+            # the agent still only purges on nodes where IT installed keepalived (install marker).
+            return {"agent_name": agent_name, "status": "teardown", "vip_id": row['vip_id'],
+                    "config_path": config_path, "keepalived": None,
+                    "purge": bool(row['purge_on_teardown'])}
+        if not row['applied_config_content']:
+            return {"agent_name": agent_name, "status": "not_configured", "config_path": config_path, "keepalived": None}
+
+        from services.keepalived_config import build_haproxy_check_script
+        check_script = build_haproxy_check_script() if row['track_haproxy'] else ""
+        return {
+            "agent_name": agent_name,
+            "status": "available",
+            "config_path": config_path,
+            "keepalived": {
+                "desired_state": "enabled",
+                "install_if_missing": True,
+                "vip_id": row['vip_id'],
+                "vip_name": row['vip_name'],
+                "config_content": row['applied_config_content'],
+                "config_hash": row['applied_config_hash'],
+                "check_script": check_script,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"keepalived-config delivery failed for '{agent_name}': {e}")
+        # Degrade to no-op rather than 500 (B-7) — keeps the fleet inert on any error.
+        return {"agent_name": agent_name, "status": "not_configured",
+                "config_path": "/etc/keepalived/keepalived.conf", "keepalived": None}
+    finally:
+        if conn:
+            await close_database_connection(conn)
+
+
+@router.post("/{agent_name}/keepalived-status")
+async def agent_keepalived_status(agent_name: str, status_data: dict, x_api_key: Optional[str] = Header(None)):
+    """Issue #27 (v1.7.0) — agent reports the outcome of a keepalived deploy/teardown.
+
+    Auth mirrors config-applied's post-Bulgu-#75 guard (reject a MISSING key — never the
+    `and` short-circuit that accepted no-key requests). The token is a shared/global install
+    token, so the status is recorded strictly for the requested agent_name and a token/name
+    mismatch is an advisory audit log (like /config-applied), not a 403 — review HIGH-1.
+    """
+    conn = None
+    try:
+        from auth_middleware import validate_agent_api_key
+        agent_auth = await validate_agent_api_key(x_api_key)
+        if not x_api_key or not agent_auth:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        if agent_auth['name'] != agent_name:
+            logger.info(f"Agent '{agent_name}' reporting keepalived status using API key from agent '{agent_auth['name']}'")
+
+        conn = await get_database_connection()
+        agent = await conn.fetchrow("SELECT id FROM agents WHERE name = $1", agent_name)
+        if not agent:
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_name}' not found")
+
+        vip_id = status_data.get("vip_id")
+        state = (status_data.get("state") or "").strip()[:24]
+        config_hash = (status_data.get("config_hash") or "")[:64]
+        message = status_data.get("message")
+        if vip_id is None:
+            # No specific VIP (e.g. a teardown ack) — update all this agent's memberships.
+            await conn.execute("""
+                UPDATE vip_members SET last_deploy_state=$2, last_deploy_message=$3,
+                    last_deploy_hash=$4, last_deploy_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE agent_id=$1
+            """, agent['id'], state, message, config_hash)
+        else:
+            await conn.execute("""
+                UPDATE vip_members SET last_deploy_state=$3, last_deploy_message=$4,
+                    last_deploy_hash=$5, last_deploy_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE agent_id=$1 AND vip_id=$2
+            """, agent['id'], int(vip_id), state, message, config_hash)
+        return {"status": "ok"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"keepalived-status update failed for '{agent_name}': {e}")
+        raise HTTPException(status_code=500, detail="keepalived-status update failed")
+    finally:
+        if conn:
+            await close_database_connection(conn)
 
 @router.get("/script-version")
 async def get_latest_script_version(platform: str = "macos"):

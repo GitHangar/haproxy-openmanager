@@ -8,6 +8,7 @@ class HAProxyClusterCreate(BaseModel):
     stats_socket_path: str = "/run/haproxy/admin.sock"
     haproxy_config_path: str = "/etc/haproxy/haproxy.cfg"
     haproxy_bin_path: str = "/usr/sbin/haproxy"  # HAProxy binary path
+    keepalived_config_path: str = "/etc/keepalived/keepalived.conf"  # HA/VIP: keepalived.conf path (Issue #27)
     pool_id: Optional[int] = None  # Which pool this cluster belongs to
 
 class HAProxyClusterUpdate(BaseModel):
@@ -17,6 +18,7 @@ class HAProxyClusterUpdate(BaseModel):
     stats_socket_path: Optional[str] = None
     haproxy_config_path: Optional[str] = None
     haproxy_bin_path: Optional[str] = None
+    keepalived_config_path: Optional[str] = None
     pool_id: Optional[int] = None
     is_active: Optional[bool] = None
     acme_enabled: Optional[bool] = None

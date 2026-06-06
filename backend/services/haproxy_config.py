@@ -908,6 +908,13 @@ async def generate_haproxy_config_for_cluster(cluster_id: int, conn: Optional[An
                 "redirect": [], "use_be": [], "default_be": [],
             }
             _stick_table_emitted = False
+            # Whether this frontend emits ANY stick-counter usage (`track-sc<N>` or an
+            # `sc_*_rate(...)` fetch). If it does but no `stick-table` is declared, HAProxy
+            # fatally rejects the WHOLE cluster config with "table '<frontend>' used but not
+            # configured". This happens with rate-limit directives baked into a frontend's
+            # stored fields (request_headers/options) by an older version or a config import.
+            # We track it here and inject a default stick-table before flushing if needed.
+            _sc_counter_used = False
             # Phase K Phase D follow-up (Bulgu #13) — same dedup
             # contract for `http-request track-sc<N> <fetch>` lines.
             # HAProxy only NEEDS one tracking call per
@@ -931,9 +938,13 @@ async def generate_haproxy_config_for_cluster(cluster_id: int, conn: Optional[An
                 correct frontend-block bucket. Idempotent for stick-table
                 lines (R3.3 dedup) AND http-request track-sc<N> lines
                 (Bulgu #13 dedup)."""
-                nonlocal _stick_table_emitted
+                nonlocal _stick_table_emitted, _sc_counter_used
                 cat = _categorize_haproxy_directive(line)
                 stripped = line.strip()
+                # Any stick-counter usage (track-sc<N> write, or an sc_*_rate(...) fetch like
+                # sc_http_req_rate(0)) requires a stick-table in this frontend.
+                if "track-sc" in stripped or ("sc_" in stripped and "_rate(" in stripped):
+                    _sc_counter_used = True
                 if cat == "stick":
                     if _stick_table_emitted and stripped.startswith("stick-table"):
                         logger.debug(
@@ -1187,6 +1198,22 @@ async def generate_haproxy_config_for_cluster(cluster_id: int, conn: Optional[An
                         _emit_fe(waf_line)
                 else:
                     logger.warning(f"Config Generation: No config lines generated for WAF rule '{waf_rule['name']}' (ID: {waf_rule['id']}, Type: {waf_rule['rule_type']})")
+
+            # Robustness fix: if this frontend uses a stick counter (track-sc<N> or an
+            # sc_*_rate(...) fetch) but declared NO stick-table, inject a default one so HAProxy
+            # doesn't fatally reject the whole cluster config with "table '<frontend>' used but
+            # not configured". This rescues rate-limit directives baked into a frontend's stored
+            # request_headers/options by an older version or import. Purely additive — it only
+            # fires when a counter is used AND no table exists (a config that is invalid today),
+            # so it never changes a frontend that already has a stick-table or doesn't rate-limit.
+            if _sc_counter_used and not _stick_table_emitted:
+                _fe_buckets["stick"].insert(
+                    0, "    stick-table type ip size 100k expire 30s store http_req_rate(10s)")
+                _stick_table_emitted = True
+                logger.info(
+                    f"STICK-TABLE AUTO-INJECT: frontend '{frontend['name']}' uses a stick "
+                    f"counter (track-sc/sc_*_rate) but declared no stick-table; injected a "
+                    f"default so the config stays valid.")
 
             # ─────────────────────────────────────────────────────────────
             # Flush the per-frontend buckets in canonical HAProxy order.

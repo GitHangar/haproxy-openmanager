@@ -484,6 +484,7 @@ async def ensure_agents_table():
                 connection_type VARCHAR(50) DEFAULT 'agent',
                 stats_socket_path VARCHAR(500) DEFAULT '/run/haproxy/admin.sock',
                 haproxy_config_path VARCHAR(500) DEFAULT '/etc/haproxy/haproxy.cfg',
+                keepalived_config_path VARCHAR(500) DEFAULT '/etc/keepalived/keepalived.conf',
                 pool_id INTEGER REFERENCES haproxy_cluster_pools(id) ON DELETE SET NULL,
                 haproxy_user VARCHAR(255) DEFAULT 'haproxy',
                 haproxy_group VARCHAR(255) DEFAULT 'haproxy',
@@ -1351,6 +1352,7 @@ async def update_system_roles_to_enterprise_rbac():
                     'apply.read', 'apply.execute', 'apply.reject', 'apply.history', 'apply.bulk', 'apply.emergency',
                     'agents.read', 'agents.create', 'agents.update', 'agents.delete', 'agents.script', 'agents.toggle', 'agents.upgrade', 'agents.version', 'agents.logs',
                     'clusters.read', 'clusters.create', 'clusters.update', 'clusters.delete', 'clusters.switch', 'clusters.config',
+                    'vip.read', 'vip.create', 'vip.update', 'vip.delete', 'vip.apply',
                     'config.read', 'config.update', 'config.download', 'config.upload', 'config.backup', 'config.restore', 'config.history', 'config.bulk_import', 'config.view_request', 'config.download_request',
                     'users.read', 'users.create', 'users.update', 'users.delete', 'users.password', 'users.roles',
                     'roles.read', 'roles.create', 'roles.update', 'roles.delete', 'roles.permissions',
@@ -1372,6 +1374,7 @@ async def update_system_roles_to_enterprise_rbac():
                     'apply.read', 'apply.execute', 'apply.reject', 'apply.history', 'apply.bulk',
                     'agents.read', 'agents.update', 'agents.toggle', 'agents.upgrade', 'agents.version', 'agents.logs',
                     'clusters.read', 'clusters.switch', 'clusters.config',
+                    'vip.read', 'vip.create', 'vip.update', 'vip.delete', 'vip.apply',
                     'config.read', 'config.update', 'config.download', 'config.history', 'config.bulk_import', 'config.view_request', 'config.download_request',
                     'statistics.read', 'statistics.performance', 'statistics.agents', 'statistics.health',
                     'activity.read'
@@ -1389,6 +1392,7 @@ async def update_system_roles_to_enterprise_rbac():
                     'apply.read', 'apply.execute', 'apply.reject', 'apply.history',
                     'agents.read', 'agents.version', 'agents.logs',
                     'clusters.read', 'clusters.switch',
+                    'vip.read',
                     'config.read', 'config.history', 'config.view_request', 'config.download_request',
                     'statistics.read', 'statistics.performance', 'statistics.agents', 'statistics.health',
                     'activity.read', 'activity.all', 'activity.export',
@@ -1407,6 +1411,7 @@ async def update_system_roles_to_enterprise_rbac():
                     'apply.read', 'apply.history',
                     'agents.read',
                     'clusters.read', 'clusters.switch',
+                    'vip.read',
                     'config.read', 'config.history', 'config.view_request',
                     'statistics.read', 'statistics.performance', 'statistics.agents', 'statistics.health',
                     'activity.read',
@@ -1715,7 +1720,24 @@ async def ensure_agent_activity_logs_table():
 #    start": once marked, same-version restarts no longer re-run (and therefore no
 #    longer auto-repair manual drift). To force a re-run, bump SCHEMA_VERSION or
 #    delete the schema_migrations row.
-SCHEMA_VERSION = 1
+#
+# v1.7.0 (Issue #27 — HA/VIP Keepalived management): bumped 1 -> 2 so the new
+# additive ensure_vip_tables() step (two brand-new tables) actually runs on
+# databases already marked at version 1. The whole re-run is idempotent.
+# v1.7.0 self-review: bumped 2 -> 3 so the additive `applied_snapshot` column on
+# vip_instances (enables VIP reject/restore-to-previous) lands on DBs marked at 2.
+# v1.7.0 self-review: bumped 3 -> 4 for the additive `keepalived_config_path` column on
+# haproxy_clusters (cluster-driven keepalived.conf path, like haproxy_config_path).
+# v1.7.0 self-review: bumped 4 -> 5 to drop the table-level UNIQUE on vip_instances.name
+# and replace it with a partial unique index (active rows only), so a soft-deleted VIP's
+# name is reusable — consistent with the address/VRID partial indexes. Idempotent re-run.
+# v1.7.2: bumped 5 -> 6 for the additive `purge_on_teardown` column on vip_instances
+# (opt-in "also uninstall the keepalived package on delete"; default FALSE keeps the safe
+# graceful-teardown behaviour). Additive + idempotent.
+# v1.7.2: bumped 6 -> 7 for the additive `pending_delete` column on vip_instances
+# (approval-gated VIP deletion: a delete is staged for Apply Management and the VIP keeps
+# running until APPROVED, so an agent never tears down without explicit human approval).
+SCHEMA_VERSION = 7
 
 
 async def run_all_migrations():
@@ -1848,6 +1870,10 @@ async def _run_all_migrations_inner():
     # Issue #18 — TOTP MFA (v1.6.0): additive columns + 3 new tables
     await ensure_mfa_columns()
 
+    # Issue #27 — HA/VIP Keepalived management (v1.7.0): two brand-new tables.
+    # MUST stay last: FK-references haproxy_cluster_pools/agents/users, all created above.
+    await ensure_vip_tables()
+
     logger.info("Database migrations completed successfully.")
 
 
@@ -1922,6 +1948,127 @@ async def ensure_mfa_columns():
     except Exception as e:
         logger.error(f"Failed to ensure MFA columns: {e}")
         # Don't raise — follow the same defensive pattern as ensure_user_activity_logs_table
+    finally:
+        if conn:
+            await close_database_connection(conn)
+
+async def ensure_vip_tables():
+    """Issue #27 — HA/VIP (Keepalived) management (v1.7.0). Additive only:
+    two brand-new tables (vip_instances, vip_members) + indexes. No ALTER of any
+    existing table, so the entire current fleet is byte-identical. Fully idempotent
+    (CREATE TABLE/INDEX IF NOT EXISTS). FK targets (haproxy_cluster_pools, agents,
+    users) are created earlier in the sequence — this function is registered LAST.
+
+    Backward-compat: a cluster/agent with no VIP row is unaffected; the agent
+    delivery endpoint returns 'not_configured' for every node without a membership.
+    """
+    conn = None
+    try:
+        conn = await get_database_connection()
+
+        # Cluster-driven keepalived.conf path (mirrors haproxy_config_path): additive +
+        # idempotent, with a universal default so operators need set nothing. The agent
+        # pulls this from its cluster, exactly like the HAProxy paths.
+        await conn.execute(
+            "ALTER TABLE haproxy_clusters ADD COLUMN IF NOT EXISTS keepalived_config_path "
+            "VARCHAR(500) DEFAULT '/etc/keepalived/keepalived.conf';")
+
+        # VIP instance: one row per virtual IP (one VRRP group), anchored to a pool.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS vip_instances (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                description TEXT,
+                pool_id INTEGER NOT NULL REFERENCES haproxy_cluster_pools(id) ON DELETE CASCADE,
+                virtual_ip VARCHAR(45) NOT NULL,
+                prefix_length INTEGER NOT NULL DEFAULT 24,
+                virtual_router_id INTEGER NOT NULL,
+                advert_int INTEGER NOT NULL DEFAULT 1,
+                auth_pass_encrypted TEXT,
+                use_unicast BOOLEAN NOT NULL DEFAULT TRUE,
+                track_haproxy BOOLEAN NOT NULL DEFAULT TRUE,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                last_config_status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                applied_snapshot JSONB,
+                created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT vip_vrid_range CHECK (virtual_router_id BETWEEN 1 AND 255)
+            );
+        """)
+        # Additive (idempotent) for DBs that created vip_instances before applied_snapshot
+        # existed (v1.7.0 self-review): holds the field-level state as of the last Apply so
+        # a pending edit can be rejected and fully reverted to the previous applied state.
+        await conn.execute("ALTER TABLE vip_instances ADD COLUMN IF NOT EXISTS applied_snapshot JSONB;")
+        # Opt-in package removal (v1.7.2): when an operator deletes a VIP and explicitly ticks
+        # "also uninstall keepalived from the node(s)", we set this flag so the teardown
+        # delivery tells the agent to purge the OS package. Default FALSE = the safe enterprise
+        # default (stop+disable+remove our config, but KEEP the package). Additive + idempotent;
+        # a node we never managed stays untouched regardless.
+        await conn.execute("ALTER TABLE vip_instances ADD COLUMN IF NOT EXISTS purge_on_teardown BOOLEAN NOT NULL DEFAULT FALSE;")
+        # Approval-gated deletion (v1.7.2): deleting a RUNNING VIP from the UI does NOT take
+        # effect immediately — it sets pending_delete=TRUE and stages a vip-*-delete version
+        # for Apply Management. The VIP stays is_active=TRUE (agents keep serving it, NOTHING
+        # is torn down) until the operator APPROVES; only then does apply flip is_active=FALSE
+        # and the agents tear down. Reject clears the flag and the VIP keeps running untouched.
+        # This guarantees an agent never tears a VIP down without an explicit human approval —
+        # protecting production. Additive + idempotent.
+        await conn.execute("ALTER TABLE vip_instances ADD COLUMN IF NOT EXISTS pending_delete BOOLEAN NOT NULL DEFAULT FALSE;")
+        # Uniqueness as PARTIAL indexes on active rows so a soft-deleted VIP frees its
+        # name/address/VRID for immediate reuse (a table-level UNIQUE would keep blocking it).
+        # NAME (v1.7.0 self-review): the original CREATE used a table-level UNIQUE on name,
+        # which left a soft-deleted VIP's name blocked (you couldn't re-create a VIP with the
+        # same name) — inconsistent with addr/VRID. Drop that constraint and use a partial
+        # index instead. Idempotent: no-op on a fresh table (no inline UNIQUE) and on re-run.
+        await conn.execute("ALTER TABLE vip_instances DROP CONSTRAINT IF EXISTS vip_instances_name_key;")
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_vip_name_active ON vip_instances(name) WHERE is_active=TRUE;"
+        )
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_vip_addr_active ON vip_instances(virtual_ip) WHERE is_active=TRUE;"
+        )
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_vip_vrid_active ON vip_instances(pool_id, virtual_router_id) WHERE is_active=TRUE;"
+        )
+
+        # Per-node membership: which agents participate + their VRRP role/priority,
+        # the applied (delivered) config snapshot, and the agent's deploy ack.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS vip_members (
+                id SERIAL PRIMARY KEY,
+                vip_id INTEGER NOT NULL REFERENCES vip_instances(id) ON DELETE CASCADE,
+                agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+                network_interface VARCHAR(64) NOT NULL,
+                role VARCHAR(10) NOT NULL DEFAULT 'BACKUP',
+                priority INTEGER NOT NULL DEFAULT 100,
+                applied_config_content TEXT,
+                applied_config_hash VARCHAR(64),
+                last_deploy_state VARCHAR(24),
+                last_deploy_message TEXT,
+                last_deploy_hash VARCHAR(64),
+                last_deploy_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT vip_member_role CHECK (role IN ('MASTER','BACKUP')),
+                CONSTRAINT vip_member_priority_range CHECK (priority BETWEEN 1 AND 254),
+                CONSTRAINT vip_member_unique UNIQUE (vip_id, agent_id)
+            );
+        """)
+        # Last line of defense against split-brain: at most one MASTER per VIP.
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_vip_one_master ON vip_members(vip_id) WHERE role='MASTER';"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vip_members_vip ON vip_members(vip_id);"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vip_members_agent ON vip_members(agent_id);"
+        )
+
+        logger.info("✅ VIP tables ensured (Issue #27 — HA/VIP Keepalived management)")
+    except Exception as e:
+        logger.error(f"Failed to ensure VIP tables: {e}")
+        # Don't raise — follow the same defensive pattern as ensure_mfa_columns
     finally:
         if conn:
             await close_database_connection(conn)
