@@ -7,6 +7,8 @@ on:
 jobs:
   build_and_push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: checkout
@@ -75,4 +77,31 @@ jobs:
             taylanbakircioglu/haproxy-openmanager-frontend:latest
             taylanbakircioglu/haproxy-openmanager-frontend:${{ steps.version.outputs.TAG }}
             taylanbakircioglu/haproxy-openmanager-frontend:${{ steps.prodversion.outputs.VERSION }}
+
+      # Keep the GitHub Releases/Tags in sync with version.json. The docker
+      # images above are tagged with the product version, but nothing here
+      # created the matching git tag, so the repo's Tags/Releases drifted
+      # behind (stuck at the last manually-created tag). After the images are
+      # pushed, cut a Release (which also creates the tag) for the current
+      # version.json, but only if one does not already exist, so re-runs
+      # without a version bump are a no-op.
+      - name: create github release from version.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.prodversion.outputs.VERSION }}"
+          TAG="v${VERSION}"
+          RELEASE_NAME=$(jq -r '.releaseName // empty' version.json)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping."
+          else
+            TITLE="$TAG"
+            [ -n "$RELEASE_NAME" ] && TITLE="$TAG — $RELEASE_NAME"
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes "Automated release for $TAG (from version.json)."
+            echo "Created release $TAG"
+          fi
 
