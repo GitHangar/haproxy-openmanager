@@ -212,6 +212,7 @@ const Settings = () => {
                 eab_kid: '',
                 eab_hmac_key: '',
                 challenge_backend_url: '',
+                dns01_enabled: false,
               }}
             >
               <Form.Item name="provider" label="ACME Provider">
@@ -304,6 +305,36 @@ const Settings = () => {
                     >
                       <Input placeholder="Auto-detect (leave empty)" />
                     </Form.Item>
+                  ),
+                }]}
+              />
+
+              {/* Issue #35: DNS-01 challenge support (global kill-switch). Per-account DNS provider
+                  credentials are configured on each ACME account in ACME Automation. */}
+              <Collapse
+                ghost
+                style={{ marginTop: 16 }}
+                items={[{
+                  key: 'dns01',
+                  label: 'DNS-01 Challenge (Advanced)',
+                  children: (
+                    <>
+                      <Alert
+                        type="info"
+                        showIcon
+                        style={{ marginBottom: 16 }}
+                        message="DNS-01 validates certificates via a DNS TXT record instead of HTTP on port 80."
+                        description="Use it for internal/isolated clusters with no public inbound port 80, or for wildcard certificates. When enabled, choose DNS-01 and a DNS provider per ACME account in ACME Automation. Leaving this off keeps the default HTTP-01 behavior unchanged."
+                      />
+                      <Form.Item
+                        name="dns01_enabled"
+                        label="Enable DNS-01 Challenge"
+                        valuePropName="checked"
+                        tooltip="Master switch. While off, DNS-01 options are hidden and no DNS-01 orders can be created."
+                      >
+                        <Switch />
+                      </Form.Item>
+                    </>
                   ),
                 }]}
               />

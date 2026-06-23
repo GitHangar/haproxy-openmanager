@@ -1737,7 +1737,11 @@ async def ensure_agent_activity_logs_table():
 # v1.7.2: bumped 6 -> 7 for the additive `pending_delete` column on vip_instances
 # (approval-gated VIP deletion: a delete is staged for Apply Management and the VIP keeps
 # running until APPROVED, so an agent never tears down without explicit human approval).
-SCHEMA_VERSION = 7
+# v1.8.0 (Issue #35 — ACME DNS-01 challenge support): bumped 7 -> 8 for additive DNS-01
+# columns on letsencrypt_accounts/letsencrypt_orders/acme_challenges and the brand-new
+# letsencrypt_account_dns_credentials table (ensure_letsencrypt_dns_credentials step).
+# All additive + idempotent; default challenge_type 'http-01' keeps existing flows byte-identical.
+SCHEMA_VERSION = 8
 
 
 async def run_all_migrations():
@@ -1851,6 +1855,9 @@ async def _run_all_migrations_inner():
     await ensure_system_settings_table()
     await ensure_acme_tables()
     await ensure_acme_columns_on_existing_tables()
+    # Issue #35 (v1.8.0 — ACME DNS-01): per-account encrypted DNS provider credentials.
+    # MUST run after ensure_acme_tables() (FK references letsencrypt_accounts).
+    await ensure_letsencrypt_dns_credentials()
     # Issue #11 cleanup: must run AFTER acme_tables/columns to ensure FK refs exist
     await cleanup_orphan_acme_challenge_backend()
     # v1.5.0 Feature A (ACME diagnostics) + Feature B (site wizard)
@@ -3649,6 +3656,23 @@ async def ensure_acme_columns_on_existing_tables():
             ('last_attempt_at', "ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ"),
             # Commit 3a: track auto-completion task lock/poll timestamps for atomic claim across replicas
             ('orders_updated_at_idx', "CREATE INDEX IF NOT EXISTS idx_letsencrypt_orders_status_updated ON letsencrypt_orders(status, updated_at) WHERE status = 'valid' AND ssl_certificate_id IS NULL"),
+            # Issue #35 (v1.8.0 — ACME DNS-01): per-account challenge method + DNS provider selection
+            ('acct_challenge_type', "ALTER TABLE letsencrypt_accounts ADD COLUMN IF NOT EXISTS challenge_type VARCHAR(20) DEFAULT 'http-01'"),
+            ('acct_dns_provider', "ALTER TABLE letsencrypt_accounts ADD COLUMN IF NOT EXISTS dns_provider VARCHAR(50)"),
+            # per-order challenge method + bounded DNS-01 retry chain (dns01_parent_order_id is a PLAIN INTEGER, not a FK,
+            # to avoid a self-referential cascade interacting with account/order bulk DELETEs)
+            ('order_challenge_type', "ALTER TABLE letsencrypt_orders ADD COLUMN IF NOT EXISTS challenge_type VARCHAR(20) DEFAULT 'http-01'"),
+            ('order_dns01_attempts', "ALTER TABLE letsencrypt_orders ADD COLUMN IF NOT EXISTS dns01_attempts INTEGER DEFAULT 0"),
+            ('order_dns01_last_attempt_at', "ALTER TABLE letsencrypt_orders ADD COLUMN IF NOT EXISTS dns01_last_attempt_at TIMESTAMPTZ"),
+            ('order_dns01_parent_order_id', "ALTER TABLE letsencrypt_orders ADD COLUMN IF NOT EXISTS dns01_parent_order_id INTEGER"),
+            ('order_dns01_retry_claimed', "ALTER TABLE letsencrypt_orders ADD COLUMN IF NOT EXISTS dns01_retry_claimed BOOLEAN DEFAULT FALSE"),
+            # per-challenge DNS-01 lifecycle state
+            ('chal_challenge_type', "ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS challenge_type VARCHAR(20) DEFAULT 'http-01'"),
+            ('chal_dns_txt_value', "ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS dns_txt_value TEXT"),
+            ('chal_dns_record_published', "ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS dns_record_published BOOLEAN DEFAULT FALSE"),
+            ('chal_dns_record_cleaned', "ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS dns_record_cleaned BOOLEAN DEFAULT FALSE"),
+            ('chal_dns_published_at', "ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS dns_published_at TIMESTAMPTZ"),
+            ('chal_manual_confirm_deadline', "ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS manual_confirm_deadline TIMESTAMPTZ"),
         ]:
             try:
                 await conn.execute(sql)
@@ -3662,6 +3686,34 @@ async def ensure_acme_columns_on_existing_tables():
         if conn:
             await close_database_connection(conn)
         logger.error(f"Error adding ACME columns: {e}")
+
+
+async def ensure_letsencrypt_dns_credentials():
+    """Issue #35 (v1.8.0 — ACME DNS-01): per-account encrypted DNS provider credentials.
+
+    Idempotent (CREATE TABLE IF NOT EXISTS). FK to letsencrypt_accounts (created earlier by
+    ensure_acme_tables). Credentials are Fernet-encrypted at rest (backend/utils/dns_credentials.py);
+    only the provider name + timestamps are ever surfaced to the API.
+    """
+    conn = None
+    try:
+        conn = await get_database_connection()
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS letsencrypt_account_dns_credentials (
+                id SERIAL PRIMARY KEY,
+                account_id INTEGER NOT NULL UNIQUE REFERENCES letsencrypt_accounts(id) ON DELETE CASCADE,
+                dns_provider VARCHAR(50) NOT NULL,
+                credentials_encrypted TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        logger.info("Ensured letsencrypt_account_dns_credentials table")
+        await close_database_connection(conn)
+    except Exception as e:
+        if conn:
+            await close_database_connection(conn)
+        logger.error(f"Error ensuring letsencrypt_account_dns_credentials: {e}")
 
 
 async def cleanup_orphan_acme_challenge_backend():

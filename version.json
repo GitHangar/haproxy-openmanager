@@ -1,5 +1,5 @@
 {
-  "version": "1.7.8",
-  "releaseName": "HA/VIP \u2014 per-node apply progress",
-  "releaseDate": "2026-06-07"
+  "version": "1.8.0",
+  "releaseName": "ACME DNS-01 challenge support",
+  "releaseDate": "2026-06-23"
 }

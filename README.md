@@ -106,6 +106,7 @@ This architecture provides better security (no inbound connections to HAProxy se
 ✅ **Real-Time Monitoring** - Live stats, health checks, and performance dashboards  
 ✅ **SSL Certificate Management** - Centralized SSL with expiration tracking  
 ✅ **ACME Auto SSL (Let's Encrypt)** - Automated certificate issuance, renewal, and deployment via ACME protocol  
+✅ **ACME DNS-01 Challenge** *(v1.8.0)* - TXT-record validation for internal/isolated clusters (no public port 80) and wildcard certificates; pluggable DNS providers (Manual + Cloudflare), opt-in, HTTP-01 unchanged  
 ✅ **ACME Certificate Diagnostic Panel** - Automated preflight that checks agent readiness, DNS resolution, port 80 reachability, and ACME challenge ACL before issuing certificates  
 ✅ **WAF Rules** - Web Application Firewall management and deployment  
 ✅ **Agent Script Versioning** - Update agents via UI (Monaco editor) with auto-upgrade  
@@ -254,6 +255,7 @@ This architecture provides better security (no inbound connections to HAProxy se
 - **Stuck Order Detection** *(v1.4.0)*: Setup wizard surfaces orders that the CA has validated but not yet downloaded, with one-click `Complete` action and automatic 60-second retry
 - **Multi-Provider Support**: Configurable ACME directory URL supports Let's Encrypt, ZeroSSL, Google Trust Services, Buypass, and custom CAs
 - **HTTP-01 Challenge**: Built-in challenge responder with automatic HAProxy routing injection; reserved backend name `_acme_challenge_backend` is auto-managed and protected from manual edits / agent sync collisions
+- **DNS-01 Challenge** *(v1.8.0 — Issue #35)*: Validate via a DNS TXT record instead of HTTP on port 80, for **internal/isolated clusters with no public ingress** and for **wildcard** certificates (`*.example.com`). Pluggable per-account DNS provider (Manual + Cloudflare to start; credentials encrypted at rest and verified on save), same PENDING → APPLIED pipeline, bounded automatic retry on propagation lag, and a DNS-01 event timeline. Opt-in via a global setting; HTTP-01 behaviour is unchanged. (See the *DNS-01 Challenge* subsection under ACME Auto SSL below.)
 - **ACME Account Management**: Register, view, and deactivate ACME accounts from the UI
 - **Staging Mode**: Test certificate issuance with Let's Encrypt staging environment before production
 - **Custom Staging Endpoint** *(v1.4.0)*: Optional `staging_url_override` setting lets you point staging mode at a private ACME test CA (e.g. Pebble) without touching the production directory URL
@@ -965,6 +967,24 @@ Understanding how HTTP-01 challenges work in a distributed HAProxy environment i
 | Separate servers | 10.0.0.10:80 | 10.0.0.20:5000 | HAProxy's public IP |
 | Behind NAT/VIP | VIP: 1.2.3.4:80 | Internal:5000 | VIP address |
 | Multi-cluster | Multiple HAProxy nodes | Central OpenManager | Each domain → respective HAProxy |
+
+#### DNS-01 Challenge — Internal/Isolated Clusters & Wildcards *(v1.8.0 — Issue #35)*
+
+The default **HTTP-01** challenge validates over **port 80**, so the domain must resolve publicly to an HAProxy node with ACME Challenge Routing enabled. **DNS-01** validates via a **DNS TXT record** (`_acme-challenge.<domain>`) instead, so it needs **no inbound port 80 and no public ingress** to the HAProxy node. Use it for:
+
+- **Internal / isolated clusters** (behind a VPN/firewall, no public port 80) where you still control the domain's DNS.
+- **Wildcard certificates** (`*.example.com`) — which can *only* be issued via DNS-01.
+
+DNS-01 is **opt-in** and fully backward compatible: it is disabled until an administrator enables it, and existing HTTP-01 certificates are completely unaffected.
+
+- **Enable it**: Settings → ACME / SSL Automation → **DNS-01 Challenge (advanced)** → turn on *Enable DNS-01 Challenge* and Save. While off, DNS-01 options are hidden and no DNS-01 orders can be created.
+- **Per-account provider**: in ACME Automation, create (or reconfigure) an ACME account with **Challenge Method = DNS-01** and a **DNS Provider**. Provider credentials are **verified before saving** and **encrypted at rest** (Fernet, mirroring the VRRP/MFA secret pattern); they are never returned by the API or written to logs.
+- **Supported providers**: **Manual** (publish the TXT record yourself in any DNS — including fully internal DNS — then click *Verify*; works everywhere but cannot auto-renew unattended) and **Cloudflare** (API token with `Zone:DNS:Edit` + `Zone:Read`; the TXT record is created and cleaned up automatically and renews unattended). The provider interface is pluggable — more providers can be added without changing the issuance flow.
+- **Same pipeline**: after validation the certificate follows the normal PENDING → APPLIED flow (assign to clusters / Apply Management) and the agent serves it — identical to HTTP-01 from finalize onward, with **zero agent or rendered-config changes** for DNS-01.
+- **Manual flow**: the order detail shows the exact `_acme-challenge.<domain>` record name + TXT value (copyable); publish it and click *I've added the records — Verify*. For Cloudflare it is automatic.
+- **Resilience**: a propagation-lag failure is recovered by a **bounded fresh-order retry chain** (1 original + 3 retries with increasing backoff, kept under Let's Encrypt's rate limits); any orphaned TXT record is cleaned up by a reconcile sweep. The order detail shows a DNS-01 event timeline (publish → validation → cleanup).
+- **Wildcards**: `*.example.com` is validated at `_acme-challenge.example.com`; it does **not** cover the apex — add `example.com` as a separate name if you need both (the providers handle the two coexisting TXT values automatically).
+- **Scope (this release)**: the Site Wizard remains HTTP-01-only; issue DNS-01 / wildcard certificates from **ACME Automation**.
 
 #### ACME Quick Start Guide
 
@@ -2395,6 +2415,7 @@ Developed with ❤️ for the HAProxy community
 
 ## Release Notes
 
+- **v1.8.0** (2026-06-23) — **ACME DNS-01 challenge support** (Issue #35): Auto SSL can now validate via a **DNS TXT record** (`_acme-challenge.<domain>`) instead of HTTP-01 on port 80, enabling certificates for **internal/isolated clusters with no public ingress** and **wildcard** certificates (`*.example.com`). Pluggable **per-account DNS provider** (Manual + Cloudflare to start; credentials verified on save and **encrypted at rest**, never returned by the API or logged), the same **PENDING → APPLIED** pipeline, a **bounded automatic retry** on propagation lag, and a **DNS-01 event timeline** in the order detail. **Opt-in** via Settings → ACME (global switch, default off); **HTTP-01 is byte-for-byte unchanged**, with **zero agent or rendered-config changes**. Manual DNS-01 certificates cannot auto-renew unattended; the UI states this and disables auto-renew for them.
 - **v1.7.8** (2026-06-07) — HA / VIP apply progress now shows **per-node** convergence: a multi-node VIP's apply popup reads "Syncing HA/VIP… 1/2 node(s) converged" (matching the HA/VIP table) instead of a coarse per-change count. Frontend-only.
 - **v1.7.7** (2026-06-07) — HA / VIP apply-progress consistency: applying a VIP change (or approving a delete) used to flash the progress popup green instantly while the HA/VIP page still showed `SYNCING (0/1)` for a couple of minutes. The popup now **keeps showing "Syncing HA/VIP… X/Y node(s) converged"** until each member node reports the VIP `ACTIVE` (create/edit) or fully torn down (delete) — exactly like the HAProxy agent-sync widget — then completes green. It's a fire-and-forget background poll (the Apply button is released immediately), bounded at ~5 min so an offline node can't spin forever (then it completes with an informational "still converging — track on the HA/VIP page"). Frontend-only; no backend/agent/schema change.
 - **v1.7.6** (2026-06-07) — HA / VIP UX + accuracy polish: (1) the on-prem/L2 cloud caveat is now a **subtle, collapsed-by-default "Network requirements" info link** instead of a prominent yellow warning. (2) The delete dialog is simplified — deletion is **always a graceful teardown** (stop & disable keepalived, remove our config, release the VIP, keep the package); the confusing "also uninstall the package" checkbox was removed (it was a no-op on any node whose keepalived predates the install marker, and package removal is better handled as a deliberate node-decommission step — the `purge_package` API remains for that). (3) The agent now reports keepalived **FAULT** state (e.g. when the chosen interface has no usable IPv4) instead of misreporting it as BACKUP, so a misconfigured VIP shows red/FAULT in the UI. (1)+(2) are frontend-only; (3) is an additive agent-script change — push it via **Agent Script Management → Reset to Defaults**, then **Upgrade**.

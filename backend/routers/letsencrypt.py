@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Header
-from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import Optional, List, Dict
 import json
 import logging
 import re
@@ -10,6 +10,40 @@ from datetime import datetime
 from database.connection import get_database_connection, close_database_connection
 from services.acme_service import acme_service
 from services.haproxy_config import generate_haproxy_config_for_cluster
+from services.dns_providers import list_providers, is_supported, get_provider, DnsProviderError
+from utils.dns_credentials import encrypt_dns_credentials, decrypt_dns_credentials
+
+# Issue #35: DNS-01 challenge methods.
+_CHALLENGE_TYPES = ("http-01", "dns-01")
+
+
+async def _dns01_enabled() -> bool:
+    """Global kill-switch (system_settings acme.dns01_enabled, default False). Read via the ACME
+    settings dict so non-admins never need the admin-only /api/settings/acme endpoint."""
+    try:
+        settings = await acme_service._get_settings()
+        val = settings.get('dns01_enabled')
+        if isinstance(val, str):
+            return val.strip().lower() in ('1', 'true', 'yes', 'on')
+        return bool(val)
+    except Exception:
+        return False
+
+
+# Per-user sliding-window rate limit for the manual dns-confirm action (soft anti-abuse so a user
+# can't spam the CA via the confirm button). Per-process; sufficient for a manual UI action.
+_DNS_CONFIRM_RL: Dict[int, list] = {}
+_DNS_CONFIRM_LIMIT = 5
+_DNS_CONFIRM_WINDOW = 60.0
+
+
+async def _enforce_dns_confirm_rate_limit(user_id: int) -> None:
+    now = time.time()
+    bucket = [t for t in _DNS_CONFIRM_RL.get(user_id, []) if now - t < _DNS_CONFIRM_WINDOW]
+    if len(bucket) >= _DNS_CONFIRM_LIMIT:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded: dns-confirm allowed 5 requests per minute")
+    bucket.append(now)
+    _DNS_CONFIRM_RL[user_id] = bucket
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +61,39 @@ class AccountCreate(BaseModel):
     tos_agreed: bool = True
     eab_kid: Optional[str] = None
     eab_hmac_key: Optional[str] = None
+    # Issue #35: per-account default challenge method + DNS provider (for dns-01).
+    challenge_type: str = "http-01"
+    dns_provider: Optional[str] = None
+
+    @field_validator('challenge_type')
+    @classmethod
+    def _validate_challenge_type(cls, v):
+        if v not in _CHALLENGE_TYPES:
+            raise ValueError(f"challenge_type must be one of {_CHALLENGE_TYPES}")
+        return v
+
+    @model_validator(mode='after')
+    def _require_provider_for_dns01(self):
+        if self.challenge_type == 'dns-01' and not (self.dns_provider or '').strip():
+            raise ValueError("dns_provider is required when challenge_type is 'dns-01'")
+        return self
+
+
+class DnsCredentialsUpsert(BaseModel):
+    dns_provider: str = Field(..., min_length=1, max_length=50)
+    credentials: Dict[str, str] = Field(default_factory=dict)
+
+    @field_validator('credentials')
+    @classmethod
+    def _validate_credentials(cls, v):
+        if len(v) > 20:
+            raise ValueError("Too many credential fields")
+        for key, val in v.items():
+            if not isinstance(key, str) or not re.match(r'^[a-zA-Z0-9_]{1,50}$', key):
+                raise ValueError(f"Invalid credential field name: {key!r}")
+            if not isinstance(val, str) or len(val) > 4000:
+                raise ValueError(f"Credential value for {key!r} is missing or too long")
+        return v
 
 
 class CertificateRequest(BaseModel):
@@ -38,6 +105,8 @@ class CertificateRequest(BaseModel):
     account_id: Optional[int] = None
     cluster_ids: List[int] = Field(default_factory=list)
     auto_renew: bool = True
+    # Issue #35: optional override; when None the account's default method is used.
+    challenge_type: Optional[str] = None
 
     @field_validator('domains')
     @classmethod
@@ -54,7 +123,30 @@ class CertificateRequest(BaseModel):
             if not _DOMAIN_REGEX.match(d_norm):
                 raise ValueError(f"Invalid domain format: '{d}'")
             normalized.append(d_norm)
-        return normalized
+        # De-duplicate (case/whitespace variants normalize to the same value) while preserving order,
+        # so we don't submit a redundant SAN to the CA or render duplicate-keyed tags in the UI.
+        return list(dict.fromkeys(normalized))
+
+    @field_validator('challenge_type')
+    @classmethod
+    def _validate_challenge_type(cls, v):
+        if v is not None and v not in _CHALLENGE_TYPES:
+            raise ValueError(f"challenge_type must be one of {_CHALLENGE_TYPES}")
+        return v
+
+    @model_validator(mode='after')
+    def _wildcard_requires_dns01(self):
+        # Static cross-field guard: a wildcard SAN can ONLY be issued via dns-01 (the CA rejects
+        # wildcard over http-01). The runtime dns01_enabled gate + provider resolution happen in the
+        # endpoint (validators can't do async/DB). When challenge_type is None here, the effective
+        # method is resolved from the account in the endpoint, which re-checks this.
+        if any((d or '').startswith('*.') for d in (self.domains or [])):
+            # Only reject when the caller EXPLICITLY chose a non-dns-01 method. When challenge_type is
+            # None, the effective method is resolved from the account in the endpoint, which re-checks
+            # wildcard-requires-dns-01 — so account-default dns-01 inheritance still works for wildcards.
+            if self.challenge_type is not None and self.challenge_type != 'dns-01':
+                raise ValueError("Wildcard certificates require challenge_type 'dns-01'")
+        return self
 
 
 # --- Account management ---
@@ -77,7 +169,7 @@ async def list_accounts(authorization: str = Header(None)):
     conn = await get_database_connection()
     try:
         rows = await conn.fetch(
-            "SELECT id, email, directory_url, account_url, status, tos_agreed, eab_kid, created_at, updated_at FROM letsencrypt_accounts ORDER BY id"
+            "SELECT id, email, directory_url, account_url, status, tos_agreed, eab_kid, created_at, updated_at, challenge_type, dns_provider FROM letsencrypt_accounts ORDER BY id"
         )
         return [dict(r) for r in rows]
     finally:
@@ -107,12 +199,21 @@ async def create_account(body: AccountCreate, authorization: str = Header(None))
         eab_kid = body.eab_kid or settings.get('eab_kid', '') or None
         eab_hmac_key = body.eab_hmac_key or settings.get('eab_hmac_key', '') or None
 
+        # Issue #35: a dns-01 account must name a supported DNS provider.
+        if body.challenge_type == 'dns-01':
+            if not await _dns01_enabled():
+                raise HTTPException(status_code=409, detail="DNS-01 is disabled by an administrator (enable it in Settings).")
+            if not is_supported((body.dns_provider or '').strip()):
+                raise HTTPException(status_code=422, detail=f"Unsupported DNS provider: {body.dns_provider}")
+
         result = await acme_service.register_account(
             email=body.email,
             directory_url=directory_url,
             tos_agreed=body.tos_agreed,
             eab_kid=eab_kid,
             eab_hmac_key=eab_hmac_key,
+            challenge_type=body.challenge_type,
+            dns_provider=(body.dns_provider or None),
         )
         return result
     except Exception as e:
@@ -186,6 +287,147 @@ async def remove_account(account_id: int, authorization: str = Header(None)):
         await close_database_connection(conn)
 
 
+# --- Issue #35: DNS-01 providers + per-account DNS credentials ---
+
+@router.get("/dns-providers")
+async def get_dns_providers(authorization: str = Header(None)):
+    """List supported DNS providers + their credential-field schema (for the UI). Also returns the
+    global dns01_enabled gate so a non-admin cert UI can read it without the admin-only settings API.
+    Authenticated (any user); not admin-only."""
+    from auth_middleware import get_current_user_from_token
+    await get_current_user_from_token(authorization)
+    return {"dns01_enabled": await _dns01_enabled(), "providers": list_providers()}
+
+
+@router.get("/accounts/{account_id}/dns-credentials")
+async def get_dns_credentials(account_id: int, authorization: str = Header(None)):
+    """Masked metadata only — provider + which credential fields are set + updated_at. NEVER returns
+    the ciphertext or any plaintext token. Read-only for any authenticated user (matches list_accounts)."""
+    from auth_middleware import get_current_user_from_token
+    await get_current_user_from_token(authorization)
+    conn = await get_database_connection()
+    try:
+        row = await conn.fetchrow(
+            "SELECT dns_provider, credentials_encrypted, updated_at FROM letsencrypt_account_dns_credentials WHERE account_id = $1",
+            account_id,
+        )
+        if not row:
+            return {"configured": False, "dns_provider": None, "credential_fields_present": [], "updated_at": None}
+        present = []
+        decrypted = decrypt_dns_credentials(row["credentials_encrypted"])
+        if isinstance(decrypted, dict):
+            present = sorted(decrypted.keys())
+        return {
+            "configured": True,
+            "dns_provider": row["dns_provider"],
+            "credential_fields_present": present,
+            "updated_at": row["updated_at"],
+        }
+    finally:
+        await close_database_connection(conn)
+
+
+@router.put("/accounts/{account_id}/dns-credentials")
+async def upsert_dns_credentials(account_id: int, body: DnsCredentialsUpsert, authorization: str = Header(None)):
+    """Store (encrypted) DNS provider credentials for an account. Admin-only. Verifies the
+    credentials against the provider BEFORE persisting; returns a sanitized result (never the token)."""
+    from auth_middleware import get_current_user_from_token
+    current_user = await get_current_user_from_token(authorization)
+    if not current_user.get('is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    provider_name = body.dns_provider.strip()
+    if not is_supported(provider_name):
+        raise HTTPException(status_code=422, detail=f"Unsupported DNS provider: {provider_name}")
+
+    conn = await get_database_connection()
+    try:
+        exists = await conn.fetchval("SELECT 1 FROM letsencrypt_accounts WHERE id = $1", account_id)
+        if not exists:
+            raise HTTPException(status_code=404, detail="ACME account not found")
+
+        # Verify credentials synchronously; only persist on success. The detail is user-safe.
+        try:
+            provider = get_provider(provider_name, dict(body.credentials))
+            verify = await provider.verify_credentials()
+        except DnsProviderError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except HTTPException:
+            raise
+        except Exception:
+            # Defensive: never let a provider-internal exception string (which could echo creds in a
+            # future provider) reach the client. Always a sanitized 422.
+            raise HTTPException(status_code=422, detail="DNS provider credential verification failed")
+        if not verify.get("ok"):
+            raise HTTPException(status_code=422, detail=verify.get("detail") or "DNS provider credential verification failed")
+
+        token = encrypt_dns_credentials(dict(body.credentials))
+        await conn.execute(
+            """INSERT INTO letsencrypt_account_dns_credentials (account_id, dns_provider, credentials_encrypted, updated_at)
+               VALUES ($1, $2, $3, NOW())
+               ON CONFLICT (account_id) DO UPDATE SET
+                   dns_provider = EXCLUDED.dns_provider,
+                   credentials_encrypted = EXCLUDED.credentials_encrypted,
+                   updated_at = NOW()""",
+            account_id, provider_name, token,
+        )
+        # Keep the account's provider selection in sync.
+        await conn.execute(
+            "UPDATE letsencrypt_accounts SET dns_provider = $1, updated_at = NOW() WHERE id = $2",
+            provider_name, account_id,
+        )
+        return {"ok": True, "dns_provider": provider_name, "detail": verify.get("detail", "Credentials stored.")}
+    finally:
+        await close_database_connection(conn)
+
+
+@router.delete("/accounts/{account_id}/dns-credentials")
+async def delete_dns_credentials(account_id: int, authorization: str = Header(None)):
+    """Remove an account's stored DNS credentials. Admin-only."""
+    from auth_middleware import get_current_user_from_token
+    current_user = await get_current_user_from_token(authorization)
+    if not current_user.get('is_admin', False):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    conn = await get_database_connection()
+    try:
+        await conn.execute("DELETE FROM letsencrypt_account_dns_credentials WHERE account_id = $1", account_id)
+        return {"ok": True}
+    finally:
+        await close_database_connection(conn)
+
+
+@router.post("/orders/{order_id}/dns-confirm")
+async def confirm_dns_order(order_id: int, authorization: str = Header(None)):
+    """Manual DNS-01 only: the user asserts the TXT record is published; tell the CA to validate.
+    Requires ssl.create + a per-user rate limit; acts only on a dns-01 + manual + pending order."""
+    from auth_middleware import get_current_user_from_token, check_user_permission
+    current_user = await get_current_user_from_token(authorization)
+    has_perm = await check_user_permission(current_user['id'], 'ssl', 'create')
+    if not has_perm:
+        raise HTTPException(status_code=403, detail="Insufficient permissions: ssl.create required")
+    await _enforce_dns_confirm_rate_limit(current_user['id'])
+
+    conn = await get_database_connection()
+    try:
+        order = await conn.fetchrow(
+            """SELECT o.id, o.status, o.challenge_type, a.dns_provider
+               FROM letsencrypt_orders o JOIN letsencrypt_accounts a ON o.account_id = a.id
+               WHERE o.id = $1""",
+            order_id,
+        )
+    finally:
+        await close_database_connection(conn)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order['challenge_type'] != 'dns-01' or (order['dns_provider'] or 'manual') != 'manual':
+        raise HTTPException(status_code=409, detail="This order is not a manual DNS-01 order")
+    if order['status'] not in ('pending', 'processing'):
+        raise HTTPException(status_code=409, detail=f"Order is '{order['status']}' and cannot be confirmed")
+
+    from services.dns01_orchestrator import confirm_manual_dns01
+    await confirm_manual_dns01(order_id)
+    return {"ok": True, "message": "DNS-01 confirmation submitted; the CA will validate shortly."}
+
+
 # --- Certificate operations ---
 
 @router.post("/certificates")
@@ -222,32 +464,61 @@ async def request_certificate(body: CertificateRequest, authorization: str = Hea
         logger.info(f"ACME: Using account_id={account_id} for certificate request")
 
         warnings = []
-        # Audit Tur 5 / Commit 8c: empty cluster_ids in UI means "global certificate".
-        # Resolve to all ACME-enabled active clusters; only fail if NONE exist.
+
+        # Issue #35: resolve the effective challenge method (request override, else account default).
+        conn_acct = await get_database_connection()
+        try:
+            acct = await conn_acct.fetchrow(
+                "SELECT challenge_type, dns_provider FROM letsencrypt_accounts WHERE id = $1", account_id
+            )
+        finally:
+            await close_database_connection(conn_acct)
+        effective_challenge = (body.challenge_type or (acct['challenge_type'] if acct else None) or 'http-01')
+        dns_provider = (acct['dns_provider'] if acct else None)
+        is_dns01 = (effective_challenge == 'dns-01')
+        has_wildcard = any(d.startswith('*.') for d in body.domains)
+
+        if is_dns01:
+            if not await _dns01_enabled():
+                raise HTTPException(status_code=409, detail="DNS-01 is disabled by an administrator (enable it in Settings).")
+            if not is_supported((dns_provider or '').strip()):
+                raise HTTPException(status_code=422, detail="The selected ACME account has no DNS provider configured for DNS-01.")
+            if (dns_provider or 'manual') == 'manual':
+                # Manual DNS-01 cannot be renewed unattended; auto-renew is forced off on the issued
+                # certificate (see _complete_certificate). Tell the requester so it isn't a surprise.
+                warnings.append(
+                    "Manual DNS-01 certificates cannot auto-renew unattended. Auto-renew will be disabled; "
+                    "re-publish the TXT record and request renewal before expiry."
+                )
+        elif has_wildcard:
+            raise HTTPException(status_code=422, detail="Wildcard certificates require a DNS-01 account.")
+
+        # Empty cluster_ids = "global certificate". For DNS-01 no ACME Challenge Routing / port 80 is
+        # needed, so resolve to ALL active clusters; http-01 still requires acme_enabled clusters.
         if not body.cluster_ids:
             conn_resolve = await get_database_connection()
             try:
-                acme_clusters_resolved = await conn_resolve.fetch(
-                    "SELECT id FROM haproxy_clusters WHERE acme_enabled = TRUE AND is_active = TRUE"
-                )
+                if is_dns01:
+                    resolved = await conn_resolve.fetch("SELECT id FROM haproxy_clusters WHERE is_active = TRUE")
+                else:
+                    resolved = await conn_resolve.fetch("SELECT id FROM haproxy_clusters WHERE acme_enabled = TRUE AND is_active = TRUE")
             finally:
                 await close_database_connection(conn_resolve)
-            if not acme_clusters_resolved:
+            if not resolved:
+                if is_dns01:
+                    raise HTTPException(status_code=422, detail="Cannot issue certificate: no active clusters configured.")
                 raise HTTPException(
                     status_code=422,
                     detail="Cannot issue certificate: no ACME-enabled clusters configured. "
                            "Enable ACME Challenge Routing on at least one cluster in Cluster Management, "
                            "Apply the configuration change, then retry."
                 )
-            body.cluster_ids = [c['id'] for c in acme_clusters_resolved]
+            body.cluster_ids = [c['id'] for c in resolved]
             warnings.append(
-                f"No clusters specified — applied to all ACME-enabled cluster(s) ({len(body.cluster_ids)})"
+                f"No clusters specified — applied to all {'active' if is_dns01 else 'ACME-enabled'} cluster(s) ({len(body.cluster_ids)})"
             )
-            logger.warning(
-                f"ACME: Empty cluster_ids → global cert fallback to {len(body.cluster_ids)} ACME-enabled cluster(s)"
-            )
-        else:
-            # Validate that referenced clusters exist + are ACME-enabled (warn-only).
+        elif not is_dns01:
+            # http-01 only: warn if no cluster has ACME Challenge Routing enabled.
             try:
                 conn_warn = await get_database_connection()
                 try:
@@ -255,7 +526,6 @@ async def request_certificate(body: CertificateRequest, authorization: str = Hea
                         "SELECT COUNT(*) FROM haproxy_clusters WHERE acme_enabled = TRUE AND is_active = TRUE"
                     )
                     if acme_clusters == 0:
-                        logger.warning("ACME: No clusters with ACME Challenge Routing enabled - certificate validation will likely fail")
                         warnings.append(
                             "No clusters have ACME Challenge Routing enabled. "
                             "Certificate validation will fail. Enable it in Cluster Management and Apply Changes first."
@@ -269,14 +539,30 @@ async def request_certificate(body: CertificateRequest, authorization: str = Hea
             account_id=account_id,
             domains=body.domains,
             cluster_ids=body.cluster_ids,
+            challenge_type=effective_challenge,
+            created_by=current_user['id'],
         )
 
-        challenges = await acme_service.respond_to_challenges(order['order_id'])
+        # Audit trail: record who requested the certificate + the method (esp. for DNS-01/wildcard,
+        # which has a wider blast radius than http-01). Never raises into the request path.
+        try:
+            from utils.activity_log import record_event
+            await record_event(
+                order['order_id'], "acme.order.requested",
+                message=f"Certificate requested ({effective_challenge}) by user {current_user['id']}",
+                details={"user_id": current_user['id'], "challenge_type": effective_challenge,
+                         "dns_provider": dns_provider, "domains": body.domains},
+            )
+        except Exception:
+            pass
 
-        # Commit 5b: re-fetch the order's *current* status from DB. The status
-        # returned by create_order() reflects the moment of creation; after
-        # respond_to_challenges() the CA may have already advanced it (e.g. to
-        # 'processing'). Surfacing stale status leads UI to under-poll.
+        # http-01 posts the challenge response immediately (token served continuously). dns-01 is
+        # driven by the orchestrator AFTER the TXT is published (manual waits for dns-confirm), so we
+        # must NOT respond here.
+        challenges = []
+        if not is_dns01:
+            challenges = await acme_service.respond_to_challenges(order['order_id'])
+
         conn_status = await get_database_connection()
         try:
             fresh_status = await conn_status.fetchval(
@@ -287,14 +573,23 @@ async def request_certificate(body: CertificateRequest, authorization: str = Hea
             await close_database_connection(conn_status)
         effective_status = fresh_status or order['status']
 
-        logger.info(f"ACME: Order {order['order_id']} created, {len(challenges)} challenge(s) posted, status={effective_status}")
+        if is_dns01:
+            msg = ("Order created. Publish the DNS TXT record shown for each domain, then confirm."
+                   if dns_provider == 'manual'
+                   else "Order created. The DNS TXT record(s) will be published automatically; waiting for CA validation.")
+        else:
+            msg = "Order created. ACME challenges have been posted. Waiting for CA validation."
+
+        logger.info(f"ACME: Order {order['order_id']} created ({effective_challenge}), status={effective_status}")
 
         return {
             "order_id": order['order_id'],
             "status": effective_status,
             "domains": body.domains,
+            "challenge_type": effective_challenge,
+            "dns_provider": dns_provider,
             "challenges": challenges,
-            "message": "Order created. ACME challenges have been posted. Waiting for CA validation.",
+            "message": msg,
             "warnings": warnings,
         }
     except HTTPException:
@@ -316,7 +611,8 @@ async def list_orders(authorization: str = Header(None)):
         rows = await conn.fetch("""
             SELECT o.id, o.account_id, o.order_url, o.status, o.domains,
                    o.ssl_certificate_id, o.cluster_ids, o.error_detail,
-                   o.created_at, o.updated_at, a.email as account_email
+                   o.created_at, o.updated_at, o.challenge_type, a.email as account_email,
+                   a.dns_provider
             FROM letsencrypt_orders o
             JOIN letsencrypt_accounts a ON o.account_id = a.id
             ORDER BY o.created_at DESC
@@ -345,7 +641,8 @@ async def get_order(order_id: int, authorization: str = Header(None)):
             SELECT o.id, o.account_id, o.order_url, o.status, o.domains,
                    o.certificate_url, o.finalize_url, o.expires_at,
                    o.error_detail, o.ssl_certificate_id, o.cluster_ids,
-                   o.created_at, o.updated_at, a.email as account_email
+                   o.created_at, o.updated_at, o.challenge_type, a.email as account_email,
+                   a.dns_provider
             FROM letsencrypt_orders o
             JOIN letsencrypt_accounts a ON o.account_id = a.id
             WHERE o.id = $1
@@ -353,13 +650,23 @@ async def get_order(order_id: int, authorization: str = Header(None)):
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
+        # Issue #35: include challenge_type + dns_txt_value (PUBLIC DNS data — NOT key_authorization,
+        # NOT the API token) so the UI can render manual DNS-01 instructions. Explicit column list.
         challenges = await conn.fetch(
-            "SELECT id, order_id, domain, token, challenge_url, status, validated_at, created_at FROM acme_challenges WHERE order_id = $1 ORDER BY domain", order_id
+            "SELECT id, order_id, domain, token, challenge_url, status, validated_at, created_at, "
+            "challenge_type, dns_txt_value FROM acme_challenges WHERE order_id = $1 ORDER BY domain", order_id
         )
         result = dict(order)
         result['domains'] = json.loads(result['domains']) if isinstance(result['domains'], str) else result['domains']
         result['cluster_ids'] = json.loads(result['cluster_ids']) if isinstance(result['cluster_ids'], str) else result['cluster_ids']
-        result['challenges'] = [dict(c) for c in challenges]
+        ch_list = []
+        for c in challenges:
+            cd = dict(c)
+            if cd.get('challenge_type') == 'dns-01':
+                # Server computes the record name (wildcard *.-stripping lives server-side).
+                cd['dns_record_name'] = acme_service._challenge_dns_name(cd['domain'])
+            ch_list.append(cd)
+        result['challenges'] = ch_list
         return result
     finally:
         await close_database_connection(conn)
@@ -470,18 +777,23 @@ async def renew_order(order_id: int, authorization: str = Header(None)):
     conn = await get_database_connection()
     try:
         order = await conn.fetchrow(
-            "SELECT account_id, domains, cluster_ids FROM letsencrypt_orders WHERE id = $1", order_id
+            "SELECT account_id, domains, cluster_ids, challenge_type FROM letsencrypt_orders WHERE id = $1", order_id
         )
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
         domains = json.loads(order['domains']) if isinstance(order['domains'], str) else order['domains']
         cluster_ids = json.loads(order['cluster_ids']) if isinstance(order['cluster_ids'], str) else order['cluster_ids']
+        challenge_type = order['challenge_type'] or 'http-01'
 
         new_order = await acme_service.create_order(
-            account_id=order['account_id'], domains=domains, cluster_ids=cluster_ids
+            account_id=order['account_id'], domains=domains, cluster_ids=cluster_ids,
+            challenge_type=challenge_type, created_by=current_user['id'],
         )
-        challenges = await acme_service.respond_to_challenges(new_order['order_id'])
-        return {"message": "Renewal order created", "new_order_id": new_order['order_id'], "challenges": challenges}
+        # dns-01 is driven by the orchestrator after the TXT is published; only http-01 responds here.
+        challenges = []
+        if challenge_type != 'dns-01':
+            challenges = await acme_service.respond_to_challenges(new_order['order_id'])
+        return {"message": "Renewal order created", "new_order_id": new_order['order_id'], "challenge_type": challenge_type, "challenges": challenges}
     finally:
         await close_database_connection(conn)
 
@@ -611,11 +923,17 @@ async def get_renewal_schedule(authorization: str = Header(None)):
         raise HTTPException(status_code=403, detail="Insufficient permissions: ssl.read required")
     conn = await get_database_connection()
     try:
+        # Issue #35: expose the challenge method/provider (via the originating order/account) so the
+        # UI can distinguish manual DNS-01 certs, which cannot auto-renew unattended. LEFT JOINs keep
+        # legacy certs (no order link / pre-DNS-01 columns) rendering as http-01.
         certs = await conn.fetch("""
-            SELECT id, name, primary_domain, expiry_date, auto_renew, days_until_expiry
-            FROM ssl_certificates
-            WHERE source = 'letsencrypt' AND is_active = TRUE
-            ORDER BY expiry_date ASC NULLS LAST
+            SELECT c.id, c.name, c.primary_domain, c.expiry_date, c.auto_renew, c.days_until_expiry,
+                   o.challenge_type, a.dns_provider
+            FROM ssl_certificates c
+            LEFT JOIN letsencrypt_orders o ON o.id = c.letsencrypt_order_id
+            LEFT JOIN letsencrypt_accounts a ON a.id = o.account_id
+            WHERE c.source = 'letsencrypt' AND c.is_active = TRUE
+            ORDER BY c.expiry_date ASC NULLS LAST
         """)
         return [dict(c) for c in certs]
     finally:
@@ -662,6 +980,18 @@ async def _complete_certificate(order_id: int) -> dict:
         domains = json.loads(order['domains']) if isinstance(order['domains'], str) else order['domains']
         cluster_ids = json.loads(order['cluster_ids']) if isinstance(order['cluster_ids'], str) else order['cluster_ids']
         primary_domain = domains[0] if domains else 'unknown'
+
+        # Issue #35: a manual DNS-01 certificate cannot be auto-renewed unattended (the renewal task
+        # skips it — see main.py), so persist auto_renew=FALSE rather than storing a misleading
+        # "Enabled" that the user trusts while the cert silently expires. http-01 and automated
+        # DNS-01 (e.g. Cloudflare) keep auto_renew=TRUE, preserving existing behaviour.
+        auto_renew_value = True
+        if order.get('challenge_type') == 'dns-01':
+            acct_provider = await conn.fetchval(
+                "SELECT dns_provider FROM letsencrypt_accounts WHERE id = $1", order['account_id']
+            )
+            if (acct_provider or 'manual') == 'manual':
+                auto_renew_value = False
 
         # Commit 5g: guard against empty cert_private_key.
         # Inserting an SSL certificate row with an empty private_key would silently
@@ -749,12 +1079,13 @@ async def _complete_certificate(order_id: int) -> dict:
                     certificate_content = $1, private_key_content = $2, chain_content = $3,
                     all_domains = $4::jsonb, expiry_date = $5, days_until_expiry = $6,
                     issuer = $7, fingerprint = $8, letsencrypt_order_id = $9,
-                    auto_renew = TRUE, is_active = TRUE, last_config_status = 'PENDING',
+                    auto_renew = $11, is_active = TRUE, last_config_status = 'PENDING',
                     updated_at = NOW()
                 WHERE id = $10
             """, cert_data['certificate_pem'], private_key_pem,
                 cert_data.get('chain_pem', ''), all_domains,
-                expiry_date, days_until_expiry, issuer, fingerprint, order_id, cert_id)
+                expiry_date, days_until_expiry, issuer, fingerprint, order_id, cert_id,
+                auto_renew_value)
             logger.info(f"ACME RENEWAL: Updated certificate {cert_id} for {primary_domain}, status=PENDING")
         else:
             cert_row = await conn.fetchrow("""
@@ -764,11 +1095,12 @@ async def _complete_certificate(order_id: int) -> dict:
                      usage_type, source, letsencrypt_order_id, auto_renew, is_active,
                      last_config_status)
                 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10,
-                        'frontend', 'letsencrypt', $11, TRUE, TRUE, 'PENDING')
+                        'frontend', 'letsencrypt', $11, $12, TRUE, 'PENDING')
                 RETURNING id
             """, f"le-{primary_domain}", cert_data['certificate_pem'], private_key_pem,
                 cert_data.get('chain_pem', ''), primary_domain, all_domains,
-                expiry_date, days_until_expiry, issuer, fingerprint, order_id)
+                expiry_date, days_until_expiry, issuer, fingerprint, order_id,
+                auto_renew_value)
             cert_id = cert_row['id']
 
         await conn.execute(
@@ -815,12 +1147,18 @@ async def _complete_certificate(order_id: int) -> dict:
             if mapped:
                 effective_cluster_ids = [r['cluster_id'] for r in mapped]
             else:
-                # Audit Tur 6 / Commit 5j: only fall back to ACME-enabled clusters.
-                # Applying renewal to ACME-disabled clusters could re-introduce Issue #11
-                # patterns and risks deploying certs to clusters where they can't be renewed.
-                all_clusters = await conn.fetch(
-                    "SELECT id FROM haproxy_clusters WHERE is_active = TRUE AND acme_enabled = TRUE"
+                # Audit Tur 6 / Commit 5j: http-01 only falls back to ACME-enabled clusters.
+                # Issue #35: a dns-01 cert needs NO challenge routing / port 80, so it can renew on
+                # any active cluster — resolve to all active clusters for dns-01.
+                ch_type = await conn.fetchval(
+                    "SELECT challenge_type FROM letsencrypt_orders WHERE id = $1", order_id
                 )
+                if ch_type == 'dns-01':
+                    all_clusters = await conn.fetch("SELECT id FROM haproxy_clusters WHERE is_active = TRUE")
+                else:
+                    all_clusters = await conn.fetch(
+                        "SELECT id FROM haproxy_clusters WHERE is_active = TRUE AND acme_enabled = TRUE"
+                    )
                 effective_cluster_ids = [r['id'] for r in all_clusters]
             if effective_cluster_ids:
                 logger.info(f"ACME RENEWAL: Resolved {len(effective_cluster_ids)} cluster(s) for global cert {cert_id}")

@@ -8,7 +8,7 @@ import redis
 import asyncio
 from datetime import datetime, timedelta
 
-_version_info = {"version": "1.7.8", "releaseName": "HA/VIP — per-node apply progress", "releaseDate": "2026-06-07"}
+_version_info = {"version": "1.8.0", "releaseName": "ACME DNS-01 challenge support", "releaseDate": "2026-06-23"}
 for _vpath in ["/app/version.json", os.path.join(os.path.dirname(__file__), "..", "version.json")]:
     try:
         with open(_vpath) as _vf:
@@ -304,6 +304,22 @@ async def complete_pending_acme_orders():
                         WHERE (
                             status IN ('pending', 'processing', 'ready')
                             OR (status = 'valid' AND ssl_certificate_id IS NULL)
+                            -- Issue #35: bounded DNS-01 retry. ONLY dns-01 invalids with remaining
+                            -- budget + elapsed backoff are claimed; http-01 invalids are NEVER matched
+                            -- (their existing skip-and-log is preserved).
+                            OR (
+                                status = 'invalid' AND challenge_type = 'dns-01'
+                                AND ssl_certificate_id IS NULL
+                                AND COALESCE(dns01_retry_claimed, FALSE) = FALSE
+                                AND COALESCE(dns01_attempts, 0) < 3
+                                AND (
+                                    dns01_last_attempt_at IS NULL
+                                    OR dns01_last_attempt_at < NOW() - (
+                                        (CASE COALESCE(dns01_attempts, 0) WHEN 0 THEN 15 WHEN 1 THEN 30 ELSE 60 END)
+                                        || ' minutes')::INTERVAL
+                                    )
+                                )
+                            )
                         )
                         AND created_at > NOW() - INTERVAL '7 days'
                         AND (updated_at IS NULL OR updated_at < NOW() - INTERVAL '30 seconds')
@@ -337,9 +353,17 @@ async def complete_pending_acme_orders():
                 continue
 
             logger.info(f"[ACME-COMPLETE] Claimed {len(claimed_ids)} order(s) for completion: {claimed_ids}")
-            
+
+            from services.dns01_orchestrator import (
+                advance_dns01_order, retry_invalid_dns01, reconcile_dns01_cleanup,
+            )
+
             for oid in claimed_ids:
                 try:
+                    # Issue #35: advance the DNS-01 publish->confirm->respond state machine for
+                    # pending dns-01 orders (no-op for http-01 or non-pending orders).
+                    await advance_dns01_order(oid)
+
                     status_info = await acme_svc.check_order_status(oid)
                     current_status = status_info.get('status')
 
@@ -352,11 +376,20 @@ async def complete_pending_acme_orders():
                         result = await _complete_certificate(oid)
                         logger.info(f"[ACME-COMPLETE] Order {oid} completed - {result.get('message', '')}")
                     elif current_status == 'invalid':
-                        logger.warning(f"[ACME-COMPLETE] Order {oid} is invalid, skipping")
+                        # Issue #35: bounded DNS-01 fresh-order retry (no-op for http-01).
+                        await retry_invalid_dns01(oid)
+                        logger.warning(f"[ACME-COMPLETE] Order {oid} is invalid")
                     elif current_status in ('pending', 'processing'):
                         logger.info(f"[ACME-COMPLETE] Order {oid} still {current_status}, will retry next cycle")
                 except Exception as poll_err:
                     logger.error(f"[ACME-COMPLETE] Failed to complete order {oid}: {poll_err}")
+
+            # Issue #35: best-effort cleanup of TXT records left published on terminal orders
+            # (covers a failed cleanup or the kill-switch being flipped off). NOT gated by the switch.
+            try:
+                await reconcile_dns01_cleanup()
+            except Exception as rec_err:
+                logger.debug(f"[ACME-COMPLETE] DNS-01 reconcile skipped: {rec_err}")
 
             # NOTE: v1.5.0 wizard-staged processing now runs BEFORE the
             # claimed_ids early-continue above (Bulgu #2 fix), so it executes
@@ -673,7 +706,9 @@ async def check_letsencrypt_renewals():
                     skip = False
                     try:
                         order = await conn2.fetchrow(
-                            "SELECT account_id, domains, cluster_ids FROM letsencrypt_orders WHERE id = $1",
+                            "SELECT o.account_id, o.domains, o.cluster_ids, o.challenge_type, a.dns_provider "
+                            "FROM letsencrypt_orders o JOIN letsencrypt_accounts a ON o.account_id = a.id "
+                            "WHERE o.id = $1",
                             order_id
                         )
                         if order:
@@ -689,15 +724,37 @@ async def check_letsencrypt_renewals():
                             if existing:
                                 logger.info(f"[ACME-RENEWAL] Skipping cert {cert['id']} - order {existing['id']} already in progress")
                                 skip = True
+                            elif (order['challenge_type'] == 'dns-01'):
+                                # Issue #35: manual DNS-01 cannot auto-renew unattended; and for an
+                                # automated provider, don't re-mint hourly if a recent retry chain already
+                                # exhausted its budget (avoids tripping the CA new-order rate limit).
+                                if (order['dns_provider'] or 'manual') == 'manual':
+                                    logger.warning(f"[ACME-RENEWAL] cert {cert['id']} uses manual DNS-01; cannot auto-renew unattended (publish the TXT and renew manually)")
+                                    skip = True
+                                else:
+                                    exhausted = await conn2.fetchrow("""
+                                        SELECT id FROM letsencrypt_orders
+                                        WHERE domains::text = $1::text AND challenge_type = 'dns-01'
+                                        AND status = 'invalid' AND COALESCE(dns01_attempts, 0) >= 3
+                                        AND created_at > NOW() - INTERVAL '24 hours'
+                                        LIMIT 1
+                                    """, json.dumps(domains))
+                                    if exhausted:
+                                        logger.warning(f"[ACME-RENEWAL] cert {cert['id']} DNS-01 renewal recently failed (check DNS); skipping re-mint for 24h")
+                                        skip = True
                     finally:
                         await close_database_connection(conn2)
 
                     if not order or skip:
                         continue
 
-                    new_order = await acme_svc.create_order(order['account_id'], domains, cluster_ids)
-                    await acme_svc.respond_to_challenges(new_order['order_id'])
-                    logger.info(f"[ACME-RENEWAL] Initiated renewal order {new_order['order_id']} for cert {cert['id']} ({cert['name']})")
+                    challenge_type = order['challenge_type'] or 'http-01'
+                    new_order = await acme_svc.create_order(order['account_id'], domains, cluster_ids, challenge_type=challenge_type)
+                    # http-01 responds immediately (token served continuously); dns-01 is driven by the
+                    # orchestrator AFTER the TXT is published (never respond before publish).
+                    if challenge_type != 'dns-01':
+                        await acme_svc.respond_to_challenges(new_order['order_id'])
+                    logger.info(f"[ACME-RENEWAL] Initiated renewal order {new_order['order_id']} ({challenge_type}) for cert {cert['id']} ({cert['name']})")
                 except Exception as cert_err:
                     logger.error(f"[ACME-RENEWAL] Failed to initiate renewal for cert {cert['id']}: {cert_err}")
 
@@ -1055,7 +1112,7 @@ async def serve_acme_challenge(token: str):
     try:
         conn = await get_database_connection()
         row = await conn.fetchrow(
-            "SELECT key_authorization FROM acme_challenges WHERE token = $1 AND (status IN ('pending', 'processing') OR status IS NULL) LIMIT 1",
+            "SELECT key_authorization FROM acme_challenges WHERE token = $1 AND (status IN ('pending', 'processing') OR status IS NULL) AND (challenge_type = 'http-01' OR challenge_type IS NULL) LIMIT 1",
             token
         )
         if row:

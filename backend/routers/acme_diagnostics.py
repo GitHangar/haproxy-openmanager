@@ -79,7 +79,7 @@ async def _load_order(conn, order_id: int) -> dict:
             """
             SELECT id, account_id, status, domains, cluster_ids, error_detail,
                    post_completion_actions, pending_apply_version_name,
-                   wizard_staged_until, created_by
+                   wizard_staged_until, created_by, challenge_type
             FROM letsencrypt_orders
             WHERE id = $1
             """,
@@ -220,6 +220,7 @@ async def run_diagnostics(order_id: int, authorization: str = Header(None)):
                 domains=domains,
                 cluster_ids=cluster_ids,
                 account_id=order["account_id"],
+                challenge_type=(order.get("challenge_type") or "http-01"),
             )
         except Exception as exc:  # noqa: BLE001 — diagnostic boundary
             # run_checks now wraps individual checks, but a top-level
@@ -335,6 +336,7 @@ async def rerun_diagnostic_check(
                 cluster_ids=cluster_ids,
                 account_id=order["account_id"],
                 only=[check_id],
+                challenge_type=(order.get("challenge_type") or "http-01"),
             )
         except Exception as exc:  # noqa: BLE001 — diagnostic boundary
             logger.exception(

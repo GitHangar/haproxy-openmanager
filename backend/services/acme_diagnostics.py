@@ -199,6 +199,23 @@ def humanize_error_detail(error_detail: Any) -> Dict[str, Any]:
     status = parsed.get("status")
     subproblems = parsed.get("subproblems") or []
 
+    # Issue #35: DNS-01 failures are recorded as {stage, reason, timestamp} (no RFC8555 "type"),
+    # so without this fallback the humanized alert would show a bare "ACME error" with no message.
+    # Surface the reason and a targeted hint so the operator knows exactly what to fix.
+    if not problem_type and parsed.get("reason"):
+        reason = str(parsed.get("reason"))
+        message = message or reason
+        title = "DNS-01 validation failed"
+        rlow = reason.lower()
+        if "decrypt" in rlow or "credential" in rlow:
+            hint = hint or "Re-enter the DNS provider credentials for this account in ACME Automation."
+        elif "zone" in rlow:
+            hint = hint or "Confirm the domain's DNS zone is managed by the configured provider and the token has access to it."
+        elif "deadline" in rlow or "expired" in rlow or "confirm" in rlow:
+            hint = hint or "The manual confirmation window passed. Create a new certificate request and publish the TXT record promptly."
+        else:
+            hint = hint or "Check the DNS TXT record and provider credentials, then retry."
+
     out = {
         "title": title,
         "message": message,
@@ -694,6 +711,7 @@ async def run_checks(
     cluster_ids: List[int],
     account_id: Optional[int],
     only: Optional[List[str]] = None,
+    challenge_type: str = "http-01",
 ) -> List[Dict[str, Any]]:
     """Execute the full pre-flight check suite. `only` lets callers re-run a
     subset (per-check rerun in the UI).
@@ -714,12 +732,29 @@ async def run_checks(
     except (TypeError, ValueError):
         safe_account_id = None
 
+    # Issue #35: DNS-01 validates via a TXT record, so the HTTP-01 reachability checks
+    # (public A record, inbound port 80, ACME Challenge Routing) do not apply — report them
+    # as `skipped` rather than failing an internal/isolated host that is actually fine.
+    is_dns01 = (challenge_type == "dns-01")
     if "dns" in selected:
-        results.append(await _safe_check("dns", "DNS resolution", check_dns(safe_domains)))
+        if is_dns01:
+            results.append(_check_result("dns", "DNS resolution", "skipped",
+                                         "DNS-01: a public A record is not required (validation is via a TXT record).",
+                                         severity="info"))
+        else:
+            results.append(await _safe_check("dns", "DNS resolution", check_dns(safe_domains)))
     if "port80" in selected:
-        results.append(await _safe_check("port80", "Port 80 reachability", check_port80(safe_domains)))
+        if is_dns01:
+            results.append(_check_result("port80", "Port 80 reachability", "skipped",
+                                         "DNS-01: inbound port 80 is not required.", severity="info"))
+        else:
+            results.append(await _safe_check("port80", "Port 80 reachability", check_port80(safe_domains)))
     if "routing" in selected:
-        results.append(await _safe_check("routing", "HAProxy routing", check_routing(conn, safe_domains, safe_cluster_ids)))
+        if is_dns01:
+            results.append(_check_result("routing", "HAProxy routing", "skipped",
+                                         "DNS-01: ACME Challenge Routing is not required.", severity="info"))
+        else:
+            results.append(await _safe_check("routing", "HAProxy routing", check_routing(conn, safe_domains, safe_cluster_ids)))
     if "account" in selected:
         results.append(await _safe_check("account", "ACME account", check_account(conn, safe_account_id)))
     if "agents" in selected:

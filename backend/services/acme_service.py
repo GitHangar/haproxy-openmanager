@@ -128,6 +128,20 @@ class ACMEService:
         digest = hashlib.sha256(ordered.encode('utf-8')).digest()
         return _b64url(digest)
 
+    @staticmethod
+    def _dns_txt_value(key_authorization: str) -> str:
+        """RFC 8555 §8.4: the DNS-01 TXT value is base64url(SHA256(key_authorization)) over the
+        RAW 32-byte digest (NOT the hexdigest)."""
+        return _b64url(hashlib.sha256(key_authorization.encode('utf-8')).digest())
+
+    @staticmethod
+    def _challenge_dns_name(identifier: str) -> str:
+        """The `_acme-challenge.<base>` record name for an ACME identifier. A leading wildcard
+        `*.` is stripped, so both `*.example.com` and bare `example.com` map to the SAME name
+        `_acme-challenge.example.com` (which is why apex+wildcard need two coexisting TXT values)."""
+        base = identifier[2:] if identifier.startswith('*.') else identifier
+        return f"_acme-challenge.{base}"
+
     def _sign_jws(self, private_key, protected: dict, payload: Any) -> dict:
         protected_b64 = _b64url(json.dumps(protected).encode('utf-8'))
         if payload == "":
@@ -208,6 +222,8 @@ class ACMEService:
         tos_agreed: bool = True,
         eab_kid: Optional[str] = None,
         eab_hmac_key: Optional[str] = None,
+        challenge_type: str = 'http-01',
+        dns_provider: Optional[str] = None,
     ) -> dict:
         directory = await self.get_directory(directory_url)
         pem, jwk = self._generate_account_key()
@@ -250,13 +266,14 @@ class ACMEService:
         conn = await get_database_connection()
         try:
             row = await conn.fetchrow("""
-                INSERT INTO letsencrypt_accounts (email, directory_url, account_url, jwk_private_key, status, tos_agreed, eab_kid)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO letsencrypt_accounts (email, directory_url, account_url, jwk_private_key, status, tos_agreed, eab_kid, challenge_type, dns_provider)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (email, directory_url) DO UPDATE SET
-                    account_url = $3, jwk_private_key = $4, status = $5, tos_agreed = $6, updated_at = NOW()
-                RETURNING id, email, directory_url, account_url, status, tos_agreed, created_at
+                    account_url = $3, jwk_private_key = $4, status = $5, tos_agreed = $6,
+                    challenge_type = $8, dns_provider = $9, updated_at = NOW()
+                RETURNING id, email, directory_url, account_url, status, tos_agreed, created_at, challenge_type, dns_provider
             """, email, directory_url, account_url, pem,
-                data.get('status') or 'valid', tos_agreed, eab_kid)
+                data.get('status') or 'valid', tos_agreed, eab_kid, challenge_type, dns_provider)
             return dict(row)
         finally:
             await close_database_connection(conn)
@@ -302,8 +319,10 @@ class ACMEService:
         account_id: int,
         domains: List[str],
         cluster_ids: Optional[List[int]] = None,
+        challenge_type: str = 'http-01',
+        created_by: Optional[int] = None,
     ) -> dict:
-        logger.info(f"ACME: Creating order for domains={domains}, account_id={account_id}")
+        logger.info(f"ACME: Creating order for domains={domains}, account_id={account_id}, challenge_type={challenge_type}")
         conn = await get_database_connection()
         try:
             account = await conn.fetchrow(
@@ -341,12 +360,12 @@ class ACMEService:
 
             order_row = await conn.fetchrow("""
                 INSERT INTO letsencrypt_orders
-                    (account_id, order_url, status, domains, finalize_url, expires_at, cluster_ids)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (account_id, order_url, status, domains, finalize_url, expires_at, cluster_ids, challenge_type, created_by)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 RETURNING id
             """, account_id, order_url, data.get('status') or 'pending',
                 json.dumps(domains), data.get('finalize') or '', expires_at,
-                json.dumps(cluster_ids or []))
+                json.dumps(cluster_ids or []), challenge_type, created_by)
 
             order_id = order_row['id']
 
@@ -383,18 +402,24 @@ class ACMEService:
                 domain = (auth_data.get('identifier') or {}).get('value', '')
                 http01_for_domain = False
                 for challenge in (auth_data.get('challenges') or []):
-                    if challenge.get('type') == 'http-01':
+                    # Store only the challenge of the CHOSEN method (default 'http-01' keeps the
+                    # existing behaviour byte-identical; 'dns-01' selects the TXT challenge instead).
+                    if challenge.get('type') == challenge_type:
                         token = challenge['token']
                         jwk = self._get_jwk(private_key)
                         thumbprint = self._jwk_thumbprint(jwk)
                         key_auth = f"{token}.{thumbprint}"
+                        dns_txt = self._dns_txt_value(key_auth) if challenge_type == 'dns-01' else None
 
                         await conn.execute("""
-                            INSERT INTO acme_challenges (order_id, domain, token, key_authorization, challenge_url, status)
-                            VALUES ($1, $2, $3, $4, $5, $6)
+                            INSERT INTO acme_challenges
+                                (order_id, domain, token, key_authorization, challenge_url, status,
+                                 challenge_type, dns_txt_value)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                         """, order_id, domain, token, key_auth,
-                            challenge.get('url') or '', challenge.get('status') or 'pending')
-                        logger.info(f"ACME: Challenge stored for domain={domain}, token={token[:20]}..., challenge_url={(challenge.get('url') or '')[:60]}")
+                            challenge.get('url') or '', challenge.get('status') or 'pending',
+                            challenge_type, dns_txt)
+                        logger.info(f"ACME: {challenge_type} challenge stored for domain={domain}, token={token[:20]}..., challenge_url={(challenge.get('url') or '')[:60]}")
                         http01_for_domain = True
                 if http01_for_domain and domain:
                     domains_with_http01.add(domain)
@@ -413,7 +438,7 @@ class ACMEService:
                     error_payload, order_id
                 )
                 raise Exception(
-                    f"ACME order {order_id} created but no http-01 challenges available "
+                    f"ACME order {order_id} created but no {challenge_type} challenges available "
                     f"(auth fetch failures: {len(auth_fetch_failures)}). See order.error_detail for diagnostics."
                 )
             elif auth_fetch_failures:
@@ -449,10 +474,15 @@ class ACMEService:
         try:
             # Issue #12 / Commit 5a: include 'failed' challenges so they can be retried,
             # but rate-limit per challenge: max 5 attempts in last 5 minutes.
+            # DNS-01 skip-gate (the single safe choke point): never POST a challenge response for a
+            # dns-01 row whose TXT record has not been published yet — that would make the CA validate
+            # against a missing record and burn the order. http-01 rows (challenge_type 'http-01'/NULL)
+            # are never excluded, so the existing flow is byte-identical.
             challenges = await conn.fetch(
                 """SELECT * FROM acme_challenges
                    WHERE order_id = $1
-                     AND (status IN ('pending', 'failed') OR status IS NULL)""",
+                     AND (status IN ('pending', 'failed') OR status IS NULL)
+                     AND NOT (COALESCE(challenge_type, 'http-01') = 'dns-01' AND COALESCE(dns_record_published, FALSE) = FALSE)""",
                 order_id
             )
             order = await conn.fetchrow(

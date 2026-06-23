@@ -51,9 +51,13 @@ def test_agent_delivery_teardown_only_on_inactive():
 
 
 def test_migration_adds_pending_delete_and_bumps_schema():
+    import re
     s = _read("database/migrations.py")
     assert "pending_delete BOOLEAN NOT NULL DEFAULT FALSE" in s
-    assert "SCHEMA_VERSION = 7" in s
+    # Schema was bumped to accommodate this column. Assert >= 7 (the version it landed in)
+    # rather than pinning an exact value, so later schema bumps don't re-break this test.
+    m = re.search(r"^SCHEMA_VERSION\s*=\s*(\d+)", s, re.MULTILINE)
+    assert m is not None and int(m.group(1)) >= 7
 
 
 def test_list_visibility_backward_compat_gates_on_applied():

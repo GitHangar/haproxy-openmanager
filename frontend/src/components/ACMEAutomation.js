@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Card, Table, Button, Tag, Space, Modal, Form, Input, Select, Steps,
   message, Row, Col, Statistic, Alert, Tooltip, Switch, theme, Segmented,
-  Tabs, Timeline, Spin, Empty
+  Tabs, Timeline, Spin, Empty, Typography, Divider
 } from 'antd';
 import {
   SafetyCertificateOutlined, PlusOutlined, ReloadOutlined,
@@ -10,7 +10,7 @@ import {
   SyncOutlined, CloseCircleOutlined,
   DeleteOutlined, EyeOutlined,
   CloudDownloadOutlined, UserOutlined, InfoCircleOutlined,
-  RocketOutlined, ExperimentOutlined
+  RocketOutlined, ExperimentOutlined, KeyOutlined
 } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useCluster } from '../contexts/ClusterContext';
@@ -20,6 +20,18 @@ const { Option } = Select;
 
 const getErrorMsg = (err, fallback) =>
   err?.response?.data?.error?.message || err?.response?.data?.detail || fallback;
+
+// Issue #35: humanize the dotted event_type tokens emitted for DNS-01 orders so the diagnostics
+// timeline reads as a step-by-step progress log rather than raw machine strings. Unknown types
+// fall back to the raw token.
+const EVENT_LABELS = {
+  'acme.dns01.publish': 'Published DNS TXT record',
+  'acme.dns01.responded': 'Asked the CA to validate',
+  'acme.dns01.validation': 'DNS-01 validation result',
+  'acme.dns01.cleanup': 'Removed DNS TXT record',
+  'acme.order.requested': 'Certificate requested',
+};
+const humanizeEventType = (t) => EVENT_LABELS[t] || t;
 
 // Render letsencrypt_orders.error_detail (TEXT column). Backend now writes
 // structured JSON-strings (stage / http_status / ca_response / timestamp) for
@@ -83,6 +95,25 @@ const ACMEAutomation = () => {
   const [orderFilter, setOrderFilter] = useState('active');
   const { token } = theme.useToken();
 
+  // Issue #35: DNS-01 provider catalog + global enable flag (from GET /dns-providers).
+  const [dnsProviders, setDnsProviders] = useState([]);
+  const [dns01Enabled, setDns01Enabled] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const regChallengeType = Form.useWatch('challenge_type', registerForm);
+  const regDnsProvider = Form.useWatch('dns_provider', registerForm);
+  const wizardAccountId = Form.useWatch('account_id', wizardForm);
+  const wizardDomains = Form.useWatch('domains', wizardForm);
+  const selectedDnsProvider = dnsProviders.find(p => p.name === regDnsProvider) || null;
+
+  // Issue #35: per-account DNS credential management (view/replace/clear after creation).
+  const [credModalVisible, setCredModalVisible] = useState(false);
+  const [credAccount, setCredAccount] = useState(null);
+  const [credMeta, setCredMeta] = useState(null);
+  const [credLoading, setCredLoading] = useState(false);
+  const [credSaving, setCredSaving] = useState(false);
+  const [credForm] = Form.useForm();
+  const credProvider = credAccount ? (dnsProviders.find(p => p.name === credAccount.dns_provider) || null) : null;
+
   // v1.5.0 Issue #13: ACME Diagnostic Panel state
   const [diagVisible, setDiagVisible] = useState(false);
   const [diagOrderId, setDiagOrderId] = useState(null);
@@ -105,18 +136,23 @@ const ACMEAutomation = () => {
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
-      const [ordersRes, accountsRes, renewalRes, clustersRes, prereqRes] = await Promise.allSettled([
+      const [ordersRes, accountsRes, renewalRes, clustersRes, prereqRes, dnsRes] = await Promise.allSettled([
         axios.get('/api/letsencrypt/orders'),
         axios.get('/api/letsencrypt/accounts'),
         axios.get('/api/letsencrypt/renewal-schedule'),
         axios.get('/api/clusters'),
         axios.get('/api/letsencrypt/prerequisites'),
+        axios.get('/api/letsencrypt/dns-providers'),
       ]);
       if (ordersRes.status === 'fulfilled') setOrders(ordersRes.value.data || []);
       if (accountsRes.status === 'fulfilled') setAccounts(accountsRes.value.data || []);
       if (prereqRes.status === 'fulfilled') setPrerequisites(prereqRes.value.data);
       if (renewalRes.status === 'fulfilled') setRenewalSchedule(renewalRes.value.data || []);
       if (clustersRes.status === 'fulfilled') setClusters(clustersRes.value.data?.clusters || []);
+      if (dnsRes.status === 'fulfilled') {
+        setDnsProviders(dnsRes.value.data?.providers || []);
+        setDns01Enabled(!!dnsRes.value.data?.dns01_enabled);
+      }
     } catch (err) {
       console.error('Error loading ACME data:', err);
     } finally {
@@ -133,9 +169,29 @@ const ACMEAutomation = () => {
     o.status === 'pending' || o.status === 'processing' || o.status === 'ready' ||
     (o.status === 'valid' && !o.ssl_certificate_id)
   );
+  // Track the order whose detail modal is open so the poll can refresh it WITHOUT
+  // making the interval depend on orderDetail (which would recreate it every poll).
+  const openDetailIdRef = useRef(null);
+  const detailRefetchInFlightRef = useRef(false);
+  useEffect(() => {
+    openDetailIdRef.current = (detailVisible && orderDetail?.id) ? orderDetail.id : null;
+  }, [detailVisible, orderDetail]);
   useEffect(() => {
     if (!hasInProgress) return undefined;
-    const interval = setInterval(() => { fetchData(); }, 30000);
+    const interval = setInterval(() => {
+      fetchData();
+      // Keep an open order-detail modal (e.g. a manual DNS-01 order awaiting validation)
+      // in sync so its status / TXT block / Verify button cannot go stale. Skip if a prior
+      // refetch is still in flight so slow backends don't pile up overlapping requests.
+      const oid = openDetailIdRef.current;
+      if (oid && !detailRefetchInFlightRef.current) {
+        detailRefetchInFlightRef.current = true;
+        axios.get(`/api/letsencrypt/orders/${oid}`)
+          .then((r) => setOrderDetail((prev) => (prev && prev.id === oid ? r.data : prev)))
+          .catch(() => { /* transient; the next poll retries */ })
+          .finally(() => { detailRefetchInFlightRef.current = false; });
+      }
+    }, 30000);
     return () => clearInterval(interval);
   }, [hasInProgress, fetchData]);
 
@@ -144,7 +200,10 @@ const ACMEAutomation = () => {
     if (!expiryDate) return null;
     return Math.ceil((new Date(expiryDate) - new Date()) / (1000 * 60 * 60 * 24));
   };
-  const nextRenewal = renewalSchedule.find(c => c.auto_renew && calcDaysLeft(c.expiry_date) > 0);
+  // Manual DNS-01 certs are not auto-renewed (even a legacy row left at auto_renew=TRUE), so they
+  // must not drive the "Next Renewal" countdown, which implies an automated event.
+  const isManualDnsCert = (c) => c.challenge_type === 'dns-01' && (c.dns_provider || 'manual') === 'manual';
+  const nextRenewal = renewalSchedule.find(c => c.auto_renew && !isManualDnsCert(c) && calcDaysLeft(c.expiry_date) > 0);
   const nextRenewalDays = nextRenewal ? calcDaysLeft(nextRenewal.expiry_date) : null;
   // Issue #11/#12: an order is "in progress" if it's pre-valid OR valid-but-not-downloaded (stuck).
   // Including 'ready' here ensures the dashboard counter & UI auto-refresh react to all in-flight states.
@@ -155,6 +214,21 @@ const ACMEAutomation = () => {
   const activeAccount = accounts.find(a => a.status === 'valid') || null;
   const acmeAccount = activeAccount || (accounts.length > 0 ? accounts[accounts.length - 1] : null);
   const acmeEnabledClusters = clusters.filter(c => c.acme_enabled && c.is_active);
+  // Issue #35: the cert wizard adapts to the selected account's challenge method.
+  const wizardAccount = accounts.find(a => a.id === wizardAccountId) || activeAccount || acmeAccount;
+  const wizardIsDns01 = (wizardAccount?.challenge_type === 'dns-01');
+  const wizardDnsManual = wizardIsDns01 && (wizardAccount?.dns_provider === 'manual');
+  // Wildcard certificates can only be issued over DNS-01. Catch this client-side so the user is
+  // told their mistake up front instead of waiting for a CA-side rejection.
+  const wizardHasWildcard = (wizardDomains || []).some(d => typeof d === 'string' && d.trim().startsWith('*.'));
+  const wizardWildcardBlocked = wizardHasWildcard && !wizardIsDns01;
+  // A DNS-01 account can exist while the global kill-switch is off (e.g. an admin disabled it later).
+  // Issuing would be rejected by the backend, so block it in the wizard with a clear reason.
+  const wizardDns01Disabled = wizardIsDns01 && !dns01Enabled;
+  // Surface a direct credentials shortcut on the dashboard card when the primary account uses an
+  // automated DNS provider (manual providers need no credentials).
+  const acmeAccountProvider = acmeAccount ? dnsProviders.find(p => p.name === acmeAccount.dns_provider) : null;
+  const acmeAccountNeedsCreds = acmeAccount?.challenge_type === 'dns-01' && (acmeAccountProvider?.credential_fields || []).length > 0;
 
   const filteredOrders = orders.filter(o => {
     if (orderFilter === 'active') return !['cancelled', 'invalid', 'valid'].includes(o.status);
@@ -170,12 +244,29 @@ const ACMEAutomation = () => {
         message.error('At least one domain is required');
         return;
       }
+      // Defense-in-depth: the Submit button is already disabled for these, but guard here too.
+      if (wizardWildcardBlocked) {
+        message.error('Wildcard certificates require a DNS-01 account. Select a DNS-01 account or remove the wildcard domain.');
+        return;
+      }
+      if (wizardDns01Disabled) {
+        message.error('DNS-01 is disabled by an administrator. Enable it in Settings > ACME to issue this certificate.');
+        return;
+      }
       setSubmitting(true);
+      // Resolve the chosen account's challenge method so DNS-01/wildcard requests are explicit.
+      // Use the same resolution as the wizard description (wizardAccount) so what the user reviewed
+      // matches what is sent.
+      const challengeType = wizardAccount?.challenge_type;  // 'http-01' | 'dns-01' | undefined
+      // Manual DNS-01 can't auto-renew (the wizard shows the switch off+disabled). Send false to
+      // match the displayed state rather than relying only on the backend to override it.
+      const autoRenew = wizardDnsManual ? false : (values.auto_renew !== false);
       const res = await axios.post('/api/letsencrypt/certificates', {
         domains: values.domains,
         cluster_ids: values.cluster_ids || [],
-        auto_renew: values.auto_renew !== false,
+        auto_renew: autoRenew,
         account_id: values.account_id || null,
+        challenge_type: challengeType || undefined,
       });
       message.success(res.data?.message || 'Certificate request submitted');
       if (res.data?.warnings?.length > 0) {
@@ -185,6 +276,16 @@ const ACMEAutomation = () => {
       setWizardStep(0);
       wizardForm.resetFields();
       fetchData();
+      // For a manual DNS-01 order the user must publish the TXT record(s) next, so open the
+      // order detail straight away instead of leaving them to hunt for it.
+      if (res.data?.challenge_type === 'dns-01'
+          && (res.data?.dns_provider || 'manual') === 'manual'
+          && res.data?.order_id) {
+        handleViewOrder(res.data.order_id);
+      } else if (res.data?.challenge_type === 'dns-01') {
+        // Automated DNS-01 (e.g. Cloudflare): reassure the user it is hands-off.
+        message.info('Automated DNS-01: the TXT records will be published and validated automatically. No action needed.', 6);
+      }
     } catch (err) {
       message.error(getErrorMsg(err, 'Failed to request certificate'));
     } finally {
@@ -234,7 +335,7 @@ const ACMEAutomation = () => {
       setOrderDetail(res.data);
       setDetailVisible(true);
     } catch (err) {
-      message.error('Failed to load order details');
+      message.error(getErrorMsg(err, 'Failed to load order details'));
     }
   };
 
@@ -453,19 +554,139 @@ const ACMEAutomation = () => {
     try {
       const values = await registerForm.validateFields();
       setRegistering(true);
+      const challengeType = dns01Enabled ? (values.challenge_type || 'http-01') : 'http-01';
+      const dnsProvider = challengeType === 'dns-01' ? (values.dns_provider || null) : null;
       const res = await axios.post('/api/letsencrypt/accounts', {
         email: values.email,
         tos_agreed: values.tos_agreed,
+        challenge_type: challengeType,
+        dns_provider: dnsProvider,
       });
-      message.success(`ACME account registered: ${res.data?.email || values.email}`);
-      setRegisterVisible(false);
-      registerForm.resetFields();
+      const accountId = res.data?.id;
+      // For an automated DNS-01 provider, store the entered credentials (verified server-side).
+      const provider = dnsProviders.find(p => p.name === dnsProvider);
+      let credFailed = false;
+      if (challengeType === 'dns-01' && accountId && provider && (provider.credential_fields || []).length > 0) {
+        const creds = {};
+        (provider.credential_fields || []).forEach(f => {
+          const v = values[`cred_${f.key}`];
+          if (v != null && v !== '') creds[f.key] = v;
+        });
+        try {
+          const r2 = await axios.put(`/api/letsencrypt/accounts/${accountId}/dns-credentials`, {
+            dns_provider: dnsProvider,
+            credentials: creds,
+          });
+          message.success(r2.data?.detail || 'DNS provider credentials saved');
+        } catch (credErr) {
+          credFailed = true;
+          message.warning(getErrorMsg(credErr, `Account "${res.data?.email || values.email}" registered, but the DNS credentials could not be saved. You can fix them from the account's DNS credentials action.`), 8);
+        }
+      }
+      // Only close + reset on full success. On a credential-save failure, keep the modal open with
+      // the entered values so the user can correct the token and re-submit (the account already
+      // exists and the PUT re-verifies) — avoids discarding input, a dead-end, and a misleading
+      // success toast (Finding 7). The warning toast above explains what to fix.
+      if (!credFailed) {
+        message.success(`ACME account registered: ${res.data?.email || values.email}`);
+        setRegisterVisible(false);
+        registerForm.resetFields();
+      }
       fetchData();
     } catch (err) {
+      // Inline field-validation rejections already render under each field; don't also
+      // fire a generic error toast (mirrors handleSaveDnsCreds).
+      if (err?.errorFields) return;
       message.error(getErrorMsg(err, 'Account registration failed'));
     } finally {
       setRegistering(false);
     }
+  };
+
+  // Issue #35: manual DNS-01 — user asserts the TXT records are published; tell the CA to validate.
+  const handleDnsConfirm = async (orderId) => {
+    if (confirming) return;  // guard the leading-edge double-click (loading alone does not block a synchronous re-fire)
+    try {
+      setConfirming(true);
+      const res = await axios.post(`/api/letsencrypt/orders/${orderId}/dns-confirm`);
+      message.success(res.data?.message || 'DNS-01 confirmation submitted; the CA will validate shortly.');
+      // Refresh the orders list AND the open detail modal so the user sees the new state
+      // (otherwise the modal shows a stale TXT block + an active Verify button).
+      fetchData();
+      try {
+        const fresh = await axios.get(`/api/letsencrypt/orders/${orderId}`);
+        // Only repopulate if the same order's detail is still open (the user may have
+        // closed it or navigated to another order while the request was in flight).
+        setOrderDetail((prev) => (prev && prev.id === orderId ? fresh.data : prev));
+      } catch (_e) { /* list refresh already happened; modal stays as-is */ }
+    } catch (err) {
+      message.error(getErrorMsg(err, 'Failed to confirm DNS-01'));
+    } finally {
+      setConfirming(false);
+    }
+  };
+
+  // Issue #35: view / replace / clear an account's DNS provider credentials after creation.
+  const openDnsCredsModal = async (account) => {
+    setCredAccount(account);
+    setCredMeta(null);
+    credForm.resetFields();
+    setCredModalVisible(true);
+    setCredLoading(true);
+    try {
+      const res = await axios.get(`/api/letsencrypt/accounts/${account.id}/dns-credentials`);
+      setCredMeta(res.data);
+    } catch (err) {
+      message.error(getErrorMsg(err, 'Failed to load DNS credentials'));
+    } finally {
+      setCredLoading(false);
+    }
+  };
+
+  const handleSaveDnsCreds = async () => {
+    if (!credAccount || !credProvider) return;
+    try {
+      const values = await credForm.validateFields();
+      setCredSaving(true);
+      const creds = {};
+      (credProvider.credential_fields || []).forEach(f => {
+        const v = values[`cred_${f.key}`];
+        if (v != null && v !== '') creds[f.key] = v;
+      });
+      const res = await axios.put(`/api/letsencrypt/accounts/${credAccount.id}/dns-credentials`, {
+        dns_provider: credAccount.dns_provider,
+        credentials: creds,
+      });
+      message.success(res.data?.detail || 'DNS provider credentials saved and verified');
+      setCredModalVisible(false);
+      credForm.resetFields();
+      fetchData();
+    } catch (err) {
+      if (err?.errorFields) return;  // antd validation errors shown inline
+      message.error(getErrorMsg(err, 'Failed to save DNS credentials'));
+    } finally {
+      setCredSaving(false);
+    }
+  };
+
+  const handleClearDnsCreds = () => {
+    if (!credAccount) return;
+    Modal.confirm({
+      title: 'Clear DNS credentials',
+      content: `Remove the stored DNS provider credentials for ${credAccount.email}? Automated DNS-01 issuance/renewal will stop working until you re-enter them.`,
+      okText: 'Clear',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await axios.delete(`/api/letsencrypt/accounts/${credAccount.id}/dns-credentials`);
+          message.success('DNS credentials cleared');
+          setCredModalVisible(false);
+          fetchData();
+        } catch (err) {
+          message.error(getErrorMsg(err, 'Failed to clear DNS credentials'));
+        }
+      },
+    });
   };
 
   const handleDeactivateAccount = (accountId, email) => {
@@ -564,7 +785,19 @@ const ACMEAutomation = () => {
       render: (status, record) => statusTag(status, record),
     },
     {
-      title: 'Account', dataIndex: 'account_email', key: 'account_email',
+      title: 'Method', key: 'method', width: 170,
+      render: (_, record) => {
+        const ct = record.challenge_type || 'http-01';
+        if (ct !== 'dns-01') return <Tag>HTTP-01</Tag>;
+        const prov = record.dns_provider || 'manual';
+        const needsAction = prov === 'manual' && (record.status === 'pending' || record.status === 'processing');
+        return needsAction
+          ? <Tag color="warning" icon={<ExclamationCircleOutlined />}>DNS-01 (manual): action needed</Tag>
+          : <Tag>DNS-01 ({prov})</Tag>;
+      },
+    },
+    {
+      title: 'Account', dataIndex: 'account_email', key: 'account_email', ellipsis: true,
       render: (e) => e || '-',
     },
     {
@@ -631,8 +864,26 @@ const ACMEAutomation = () => {
       },
     },
     {
+      title: 'Method', key: 'method', width: 130,
+      render: (_, record) => {
+        const ct = record.challenge_type || 'http-01';
+        if (ct !== 'dns-01') return <Tag>HTTP-01</Tag>;
+        return <Tag>DNS-01 ({record.dns_provider || 'manual'})</Tag>;
+      },
+    },
+    {
       title: 'Auto-Renew', dataIndex: 'auto_renew', key: 'auto_renew',
-      render: (v) => v ? <Tag color="green">Enabled</Tag> : <Tag>Disabled</Tag>,
+      render: (v, record) => {
+        const isManualDns = record.challenge_type === 'dns-01' && (record.dns_provider || 'manual') === 'manual';
+        if (isManualDns) {
+          return (
+            <Tooltip title="Manual DNS-01 cannot auto-renew unattended. Re-publish the TXT record and request renewal before expiry.">
+              <Tag color="warning" icon={<ExclamationCircleOutlined />}>Manual (re-publish TXT)</Tag>
+            </Tooltip>
+          );
+        }
+        return v ? <Tag color="green">Enabled</Tag> : <Tag>Disabled</Tag>;
+      },
     },
   ];
 
@@ -655,8 +906,19 @@ const ACMEAutomation = () => {
           <Alert
             type="info"
             showIcon
-            message="Each domain must resolve to an HAProxy node with ACME challenge routing enabled."
+            message={wizardIsDns01
+              ? "DNS-01: validated via a DNS TXT record, so no public port 80 is needed. Wildcards (*.example.com) are supported. Note that a wildcard does not cover the bare apex (example.com); add it as a separate domain if you need both."
+              : "Each domain must resolve to an HAProxy node with ACME challenge routing enabled (HTTP-01)."}
           />
+          {wizardWildcardBlocked && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: 12 }}
+              message="Wildcard requires a DNS-01 account"
+              description="A wildcard domain (*.example.com) can only be validated over DNS-01. The currently selected account uses HTTP-01. Choose a DNS-01 account in the next step, or remove the wildcard domain."
+            />
+          )}
         </>
       ),
     },
@@ -668,20 +930,63 @@ const ACMEAutomation = () => {
             <Select mode="multiple" placeholder="Leave empty for global certificate" allowClear>
               {clusters.map(c => (
                 <Option key={c.id} value={c.id}>
-                  {c.name} {c.acme_enabled ? '' : '(ACME not enabled)'}
+                  {c.name} {wizardIsDns01 ? '' : (c.acme_enabled ? '' : '(ACME not enabled)')}
                 </Option>
               ))}
             </Select>
           </Form.Item>
-          <Form.Item name="auto_renew" label="Auto-Renew" valuePropName="checked" initialValue={true}>
-            <Switch defaultChecked />
-          </Form.Item>
+          {wizardIsDns01 && (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="DNS-01 needs no ACME Challenge Routing. Any active cluster works."
+              description={wizardDnsManual
+                ? "This account uses a manual DNS provider: after submitting, open the order and publish the shown TXT record, then confirm."
+                : "The DNS TXT record(s) will be published automatically."}
+            />
+          )}
+          {wizardDnsManual ? (
+            // Manual DNS-01 cannot auto-renew (the backend forces it off); show the control off and
+            // disabled so it matches the outcome rather than implying an automated renewal.
+            <Form.Item label="Auto-Renew">
+              <Switch checked={false} disabled />
+            </Form.Item>
+          ) : (
+            <Form.Item name="auto_renew" label="Auto-Renew" valuePropName="checked" initialValue={true}>
+              <Switch />
+            </Form.Item>
+          )}
+          {wizardDnsManual && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: -8, marginBottom: 16 }}
+              message="Manual DNS-01 cannot auto-renew unattended. You will need to re-publish the TXT record at renewal time."
+            />
+          )}
           {accounts.length > 1 && (
-            <Form.Item name="account_id" label="ACME Account">
-              <Select placeholder="Use default account">
-                {accounts.map(a => (
-                  <Option key={a.id} value={a.id}>{a.email} ({a.directory_url})</Option>
-                ))}
+            <Form.Item
+              name="account_id"
+              label="ACME Account"
+              extra={<span style={{ fontSize: 12, color: token.colorTextSecondary }}>The validation method (HTTP-01 or DNS-01) is set by the chosen account. To use DNS-01, pick a DNS-01 account.</span>}
+            >
+              <Select placeholder="Use default account" optionLabelProp="label">
+                {accounts.map(a => {
+                  // Match the parenthesized "DNS-01 (provider)" form used in the tables and order detail.
+                  const methodLabel = a.challenge_type === 'dns-01'
+                    ? `DNS-01 (${a.dns_provider || 'manual'})`
+                    : 'HTTP-01';
+                  return (
+                    <Option key={a.id} value={a.id} label={`${a.email} · ${methodLabel}`}>
+                      <span>{a.email}{' '}
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          {methodLabel} · {a.directory_url}
+                        </Typography.Text>
+                      </span>
+                    </Option>
+                  );
+                })}
               </Select>
             </Form.Item>
           )}
@@ -707,7 +1012,31 @@ const ACMEAutomation = () => {
               style={{ marginBottom: 16 }}
             />
           )}
-          {acmeEnabledClusters.length === 0 && (
+          {wizardDns01Disabled && (
+            <Alert
+              type="error"
+              showIcon
+              message="DNS-01 is disabled"
+              description={
+                <span>
+                  This account uses DNS-01, but DNS-01 is currently disabled by an administrator.{' '}
+                  <Button type="link" size="small" style={{ padding: 0 }} onClick={() => navigate('/settings?tab=acme')}>Enable it in Settings &gt; ACME</Button>
+                  {' '}to issue this certificate.
+                </span>
+              }
+              style={{ marginBottom: 16 }}
+            />
+          )}
+          {wizardWildcardBlocked && (
+            <Alert
+              type="error"
+              showIcon
+              message="Wildcard requires a DNS-01 account"
+              description="Remove the wildcard domain or select a DNS-01 account in the Configuration step."
+              style={{ marginBottom: 16 }}
+            />
+          )}
+          {!wizardIsDns01 && acmeEnabledClusters.length === 0 && (
             <Alert
               type="warning"
               showIcon
@@ -723,7 +1052,7 @@ const ACMEAutomation = () => {
               style={{ marginBottom: 16 }}
             />
           )}
-          {prerequisites?.steps?.find(s => s.key === 'config_applied' && s.ok === false) && (() => {
+          {!wizardIsDns01 && prerequisites?.steps?.find(s => s.key === 'config_applied' && s.ok === false) && (() => {
             const configStep = prerequisites.steps.find(s => s.key === 'config_applied');
             const pendingNames = (configStep?.pending_clusters || []).map(c => c.name).join(', ');
             return (
@@ -755,8 +1084,17 @@ const ACMEAutomation = () => {
             description={
               <ul style={{ margin: 0, paddingLeft: 20 }}>
                 <li>ACME Account: {activeAccount ? <Tag color="success">Active ({activeAccount.email})</Tag> : <Tag color="error">No active account</Tag>}</li>
-                <li>ACME-enabled Clusters: {acmeEnabledClusters.length > 0 ? <Tag color="success">{acmeEnabledClusters.map(c => c.name).join(', ')}</Tag> : <Tag color="warning">None</Tag>}</li>
-                <li>Domains must resolve to HAProxy node IPs for HTTP-01 validation</li>
+                {wizardIsDns01 ? (
+                  <>
+                    <li>Challenge Method: <Tag>DNS-01</Tag> (TXT record; no port 80 / ACME routing needed)</li>
+                    <li>DNS provider: <Tag>{wizardAccount?.dns_provider || 'manual'}</Tag></li>
+                  </>
+                ) : (
+                  <>
+                    <li>ACME-enabled Clusters: {acmeEnabledClusters.length > 0 ? <Tag color="success">{acmeEnabledClusters.map(c => c.name).join(', ')}</Tag> : <Tag color="warning">None</Tag>}</li>
+                    <li>Domains must resolve to HAProxy node IPs for HTTP-01 validation</li>
+                  </>
+                )}
               </ul>
             }
           />
@@ -807,9 +1145,15 @@ const ACMEAutomation = () => {
 
       {pendingOrders.length > 0 && (() => {
         const stuckCount = pendingOrders.filter(isOrderStuck).length;
-        const inFlightCount = pendingOrders.length - stuckCount;
+        // Manual DNS-01 orders are waiting on the USER to publish a TXT record, not on the CA —
+        // call them out separately so the action item is visible without scanning the table.
+        const manualDnsAwaiting = pendingOrders.filter(o =>
+          o.challenge_type === 'dns-01' && (o.dns_provider || 'manual') === 'manual'
+          && (o.status === 'pending' || o.status === 'processing')).length;
+        const inFlightCount = pendingOrders.length - stuckCount - manualDnsAwaiting;
         const parts = [];
         if (inFlightCount > 0) parts.push(`${inFlightCount} awaiting validation`);
+        if (manualDnsAwaiting > 0) parts.push(`${manualDnsAwaiting} manual DNS-01 awaiting your TXT record${manualDnsAwaiting > 1 ? 's' : ''}`);
         if (stuckCount > 0) parts.push(`${stuckCount} pending download (auto-retrying every 60s)`);
         return (
           <Alert
@@ -817,9 +1161,11 @@ const ACMEAutomation = () => {
             showIcon
             icon={<ExclamationCircleOutlined />}
             message={`${pendingOrders.length} certificate order(s) in progress: ${parts.join(', ')}`}
-            description={stuckCount > 0
-              ? "Stuck orders will auto-complete via the background task. You can also click \"Complete\" to retry immediately."
-              : undefined}
+            description={manualDnsAwaiting > 0
+              ? "Open a manual DNS-01 order to see the TXT record to publish, then confirm it."
+              : stuckCount > 0
+                ? "Stuck orders will auto-complete via the background task. You can also click \"Complete\" to retry immediately."
+                : undefined}
             style={{ marginBottom: 16 }}
           />
         );
@@ -864,6 +1210,11 @@ const ACMEAutomation = () => {
               {acmeAccount && (
                 <Button type="link" size="small" style={{ padding: 0 }} onClick={() => setAccountDetailVisible(true)}>
                   <InfoCircleOutlined /> Manage
+                </Button>
+              )}
+              {acmeAccountNeedsCreds && (
+                <Button type="link" size="small" style={{ padding: 0 }} onClick={() => openDnsCredsModal(acmeAccount)}>
+                  <KeyOutlined /> DNS credentials
                 </Button>
               )}
             </div>
@@ -965,7 +1316,7 @@ const ACMEAutomation = () => {
             </Button>
           )}
           {wizardStep === wizardSteps.length - 1 && (
-            <Button type="primary" onClick={handleRequestCert} loading={submitting} disabled={!activeAccount || acmeEnabledClusters.length === 0}>
+            <Button type="primary" onClick={handleRequestCert} loading={submitting} disabled={!activeAccount || wizardWildcardBlocked || wizardDns01Disabled || (!wizardIsDns01 && acmeEnabledClusters.length === 0)}>
               Submit Request
             </Button>
           )}
@@ -994,7 +1345,7 @@ const ACMEAutomation = () => {
                 </Tag>
               ) : orderDetail.status === 'valid' ? (
                 <Tag color="warning" icon={<ExclamationCircleOutlined />}>
-                  Pending download — auto-completion task will retry every 60s
+                  Pending download. Auto-completion task will retry every 60s
                 </Tag>
               ) : orderDetail.status === 'invalid' || orderDetail.status === 'cancelled' ? (
                 <Tag color="default">Not issued</Tag>
@@ -1010,6 +1361,71 @@ const ACMEAutomation = () => {
                 style={{ marginBottom: 16 }}
               />
             )}
+            {orderDetail.challenge_type === 'dns-01'
+              && !(orderDetail.challenges || []).some(c => c.challenge_type === 'dns-01')
+              && (orderDetail.status === 'pending' || orderDetail.status === 'processing') && (
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message="Preparing DNS-01 challenge"
+                description="The TXT record(s) for this order are being provisioned. They will appear here shortly; this view refreshes automatically."
+              />
+            )}
+            {orderDetail.challenge_type === 'dns-01' && (orderDetail.challenges || []).some(c => c.challenge_type === 'dns-01') && (() => {
+              const dnsChallenges = (orderDetail.challenges || []).filter(c => c.challenge_type === 'dns-01');
+              const isManual = (orderDetail.dns_provider || 'manual') === 'manual';
+              const canConfirm = isManual && (orderDetail.status === 'pending' || orderDetail.status === 'processing');
+              return (
+                <Alert
+                  type={isManual ? 'warning' : 'info'}
+                  showIcon
+                  style={{ marginBottom: 16 }}
+                  message={isManual
+                    ? 'DNS-01 (manual): publish these TXT record(s), then verify'
+                    : 'DNS-01 (automated): the TXT record(s) are published for you'}
+                  description={
+                    <div>
+                      <div style={{ marginBottom: 8 }}>
+                        Add the following DNS TXT record{dnsChallenges.length > 1 ? 's' : ''} at your DNS provider:
+                      </div>
+                      <Table
+                        size="small"
+                        pagination={false}
+                        dataSource={dnsChallenges}
+                        rowKey="id"
+                        scroll={{ x: 'max-content' }}
+                        columns={[
+                          { title: 'Record name', dataIndex: 'dns_record_name', key: 'name',
+                            render: (v) => v ? <Typography.Text code copyable style={{ wordBreak: 'break-all' }}>{v}</Typography.Text> : <Typography.Text type="secondary">-</Typography.Text> },
+                          { title: 'Type', key: 'type', width: 60, render: () => 'TXT' },
+                          { title: 'Value', dataIndex: 'dns_txt_value', key: 'val',
+                            render: (v) => v ? <Typography.Text code copyable style={{ wordBreak: 'break-all' }}>{v}</Typography.Text> : <Typography.Text type="secondary">-</Typography.Text> },
+                        ]}
+                      />
+                      {canConfirm && (
+                        <>
+                          <div style={{ marginTop: 12, fontSize: 12, color: token.colorTextSecondary }}>
+                            DNS changes can take a few minutes to propagate. If verification fails,
+                            wait a short while and try again. The order keeps retrying in the background.
+                          </div>
+                          <Button
+                            type="primary"
+                            size="small"
+                            loading={confirming}
+                            disabled={confirming}
+                            style={{ marginTop: 8 }}
+                            onClick={() => handleDnsConfirm(orderDetail.id)}
+                          >
+                            I've added the record(s), verify now
+                          </Button>
+                        </>
+                      )}
+                    </div>
+                  }
+                />
+              );
+            })()}
             {orderDetail.challenges?.length > 0 && (
               <>
                 <h4>Challenges</h4>
@@ -1020,7 +1436,10 @@ const ACMEAutomation = () => {
                   rowKey="id"
                   columns={[
                     { title: 'Domain', dataIndex: 'domain', key: 'domain' },
-                    { title: 'Token', dataIndex: 'token', key: 'token', ellipsis: true },
+                    { title: 'Method', dataIndex: 'challenge_type', key: 'method', width: 90,
+                      render: (ct) => <Tag>{(ct || 'http-01') === 'dns-01' ? 'DNS-01' : 'HTTP-01'}</Tag> },
+                    { title: 'Token', dataIndex: 'token', key: 'token', ellipsis: true,
+                      render: (t, r) => (r.challenge_type === 'dns-01') ? <Typography.Text type="secondary">TXT-based (see above)</Typography.Text> : t },
                     { title: 'Status', dataIndex: 'status', key: 'status', render: (s) => statusTag(s) },
                   ]}
                 />
@@ -1047,7 +1466,7 @@ const ACMEAutomation = () => {
             rowKey="id"
             columns={[
               {
-                title: 'Email', dataIndex: 'email', key: 'email',
+                title: 'Email', dataIndex: 'email', key: 'email', ellipsis: true,
                 render: (email) => <strong>{email}</strong>,
               },
               {
@@ -1098,6 +1517,10 @@ const ACMEAutomation = () => {
                                   </p>
                                 )}
                                 {record.eab_kid && <p><strong>EAB Key ID:</strong> {record.eab_kid}</p>}
+                                <p><strong>Challenge Method:</strong> {(record.challenge_type || 'http-01') === 'dns-01' ? 'DNS-01' : 'HTTP-01'}</p>
+                                {(record.challenge_type === 'dns-01') && (
+                                  <p><strong>DNS Provider:</strong> {record.dns_provider || 'manual'}</p>
+                                )}
                                 <p><strong>ToS Accepted:</strong> {record.tos_agreed ? 'Yes' : 'No'}</p>
                                 <p><strong>Registered:</strong> {record.created_at ? new Date(record.created_at).toLocaleString() : '-'}</p>
                               </div>
@@ -1106,6 +1529,16 @@ const ACMEAutomation = () => {
                         }}
                       />
                     </Tooltip>
+                    {record.challenge_type === 'dns-01'
+                      && (dnsProviders.find(p => p.name === record.dns_provider)?.credential_fields || []).length > 0 && (
+                      <Tooltip title="DNS Provider Credentials">
+                        <Button
+                          icon={<KeyOutlined />}
+                          size="small"
+                          onClick={() => openDnsCredsModal(record)}
+                        />
+                      </Tooltip>
+                    )}
                     {record.status !== 'deactivated' ? (
                       <Tooltip title="Deactivate">
                         <Button
@@ -1154,7 +1587,7 @@ const ACMEAutomation = () => {
           message="ACME account will be registered with the directory URL configured in Settings > ACME."
           style={{ marginBottom: 16 }}
         />
-        <Form form={registerForm} layout="vertical">
+        <Form form={registerForm} layout="vertical" preserve={false}>
           <Form.Item
             name="email"
             label="Contact Email"
@@ -1167,11 +1600,12 @@ const ACMEAutomation = () => {
           </Form.Item>
           <Form.Item
             name="tos_agreed"
+            label="Terms of Service"
             valuePropName="checked"
             initialValue={false}
             rules={[{ validator: (_, v) => v ? Promise.resolve() : Promise.reject('You must accept the Terms of Service') }]}
           >
-            <Switch checkedChildren="Accepted" unCheckedChildren="Not Accepted" />
+            <Switch checkedChildren="Accepted" unCheckedChildren="Not Accepted" aria-label="Accept Terms of Service" />
           </Form.Item>
           <div style={{ fontSize: 12, color: token.colorTextSecondary }}>
             By accepting, you agree to the ACME CA's Terms of Service (e.g.{' '}
@@ -1179,12 +1613,141 @@ const ACMEAutomation = () => {
               Let's Encrypt Subscriber Agreement
             </a>).
           </div>
+          {dns01Enabled && (
+            <>
+              <Divider style={{ margin: '16px 0 12px' }} />
+              <Form.Item
+                name="challenge_type"
+                label="Challenge Method"
+                initialValue="http-01"
+                tooltip="HTTP-01 validates over port 80. DNS-01 validates via a DNS TXT record. It works for internal/isolated clusters (no public port 80) and supports wildcards."
+              >
+                <Select>
+                  <Option value="http-01">HTTP-01 (default)</Option>
+                  <Option value="dns-01">DNS-01 (TXT record)</Option>
+                </Select>
+              </Form.Item>
+              {regChallengeType === 'dns-01' && (
+                <>
+                  {dnsProviders.length === 0 ? (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      message="No DNS providers are available"
+                      description="DNS-01 appears enabled, but no provider catalog was returned. Confirm DNS-01 is enabled in Settings and that the backend is reachable, then reopen this dialog."
+                    />
+                  ) : (
+                  <Form.Item
+                    name="dns_provider"
+                    label="DNS Provider"
+                    rules={[{ required: true, message: 'Select a DNS provider' }]}
+                  >
+                    <Select placeholder="Select a DNS provider">
+                      {dnsProviders.map(p => (
+                        <Option key={p.name} value={p.name}>{p.label}</Option>
+                      ))}
+                    </Select>
+                  </Form.Item>
+                  )}
+                  {selectedDnsProvider && (selectedDnsProvider.credential_fields || []).length > 0 && (
+                    <>
+                      <Alert
+                        type="info"
+                        showIcon
+                        style={{ marginBottom: 12 }}
+                        message="Provider credentials are encrypted at rest and verified before they are saved. The token needs permission to create and delete TXT records in your domain's DNS zone."
+                      />
+                      {(selectedDnsProvider.credential_fields || []).map(f => (
+                        <Form.Item
+                          key={f.key}
+                          name={`cred_${f.key}`}
+                          label={f.label}
+                          extra={f.help ? <span style={{ fontSize: 12, color: token.colorTextSecondary }}>{f.help}</span> : null}
+                          rules={f.required ? [{ required: true, message: `${f.label} is required` }] : []}
+                        >
+                          {f.type === 'password'
+                            ? <Input.Password placeholder={f.label} maxLength={f.max_length || undefined} />
+                            : <Input placeholder={f.label} maxLength={f.max_length || undefined} />}
+                        </Form.Item>
+                      ))}
+                    </>
+                  )}
+                  {selectedDnsProvider && !selectedDnsProvider.automated && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      message="Manual DNS provider"
+                      description="You will publish the DNS TXT record yourself and confirm it. Manual DNS-01 certificates cannot auto-renew unattended."
+                    />
+                  )}
+                </>
+              )}
+            </>
+          )}
         </Form>
+      </Modal>
+
+      {/* Issue #35: DNS provider credentials for an existing DNS-01 account (view / replace / clear) */}
+      <Modal
+        title={<span><KeyOutlined /> DNS Provider Credentials{credAccount ? `: ${credAccount.email}` : ''}</span>}
+        open={credModalVisible}
+        onCancel={() => { setCredModalVisible(false); credForm.resetFields(); }}
+        width={560}
+        footer={[
+          <Button key="clear" danger onClick={handleClearDnsCreds} disabled={!credMeta?.configured || credSaving}>
+            Clear credentials
+          </Button>,
+          <Button key="cancel" onClick={() => { setCredModalVisible(false); credForm.resetFields(); }}>
+            Cancel
+          </Button>,
+          <Button key="save" type="primary" loading={credSaving} onClick={handleSaveDnsCreds}>
+            Save & verify
+          </Button>,
+        ]}
+      >
+        {credLoading ? (
+          <div style={{ textAlign: 'center', padding: 24 }}><Spin /></div>
+        ) : (
+          <>
+            <p style={{ marginBottom: 4 }}>
+              <strong>Provider:</strong> {credAccount?.dns_provider || '-'}
+            </p>
+            <p style={{ marginTop: 0, fontSize: 12, color: token.colorTextSecondary }}>
+              {credMeta?.configured
+                ? `Configured: ${(credMeta.credential_fields_present || []).join(', ') || '(none)'}${credMeta.updated_at ? ` · updated ${new Date(credMeta.updated_at).toLocaleString()}` : ''}`
+                : 'No credentials are stored yet for this account.'}
+            </p>
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="Existing values are never shown. Enter the values to (re)store them; they are verified against the provider and encrypted at rest. The token needs permission to create and delete TXT records in your domain's DNS zone."
+            />
+            <Form form={credForm} layout="vertical">
+              {(credProvider?.credential_fields || []).map(f => (
+                <Form.Item
+                  key={f.key}
+                  name={`cred_${f.key}`}
+                  label={f.label}
+                  rules={f.required ? [{ required: true, message: `${f.label} is required` }] : []}
+                  extra={f.help ? <span style={{ fontSize: 12, color: token.colorTextSecondary }}>{f.help}</span> : null}
+                >
+                  {f.type === 'password'
+                    ? <Input.Password placeholder={f.label} maxLength={f.max_length || undefined} />
+                    : <Input placeholder={f.label} maxLength={f.max_length || undefined} />}
+                </Form.Item>
+              ))}
+              {(credProvider?.credential_fields || []).length === 0 && (
+                <Alert type="warning" showIcon message="This provider needs no credentials (manual mode)." />
+              )}
+            </Form>
+          </>
+        )}
       </Modal>
 
       {/* v1.5.0 Issue #13: ACME Diagnostic Panel modal */}
       <Modal
-        title={diagOrderId ? `Diagnostics — Order #${diagOrderId}` : 'Diagnostics'}
+        title={diagOrderId ? `Diagnostics: Order #${diagOrderId}` : 'Diagnostics'}
         open={diagVisible}
         onCancel={closeDiagModal}
         width={920}
@@ -1266,12 +1829,21 @@ const ACMEAutomation = () => {
                           {
                             title: 'Re-run', key: 'rerun', width: 90,
                             render: (_, record) => (
-                              <Button
-                                size="small"
-                                icon={<ReloadOutlined />}
-                                loading={diagRunningCheckId === record.id}
-                                onClick={() => handleRerunCheck(record.id)}
-                              />
+                              // A skipped check (e.g. port 80 / routing for a DNS-01 order) has no
+                              // transient cause to re-test, so re-running just reproduces "skipped".
+                              record.status === 'skipped'
+                                ? <Typography.Text type="secondary">-</Typography.Text>
+                                : (
+                                  <Tooltip title="Re-run this check">
+                                    <Button
+                                      size="small"
+                                      aria-label="Re-run this check"
+                                      icon={<ReloadOutlined />}
+                                      loading={diagRunningCheckId === record.id}
+                                      onClick={() => handleRerunCheck(record.id)}
+                                    />
+                                  </Tooltip>
+                                )
                             ),
                           },
                         ]}
@@ -1327,13 +1899,13 @@ const ACMEAutomation = () => {
                         type="warning"
                         showIcon
                         style={{ marginBottom: 12 }}
-                        message="Event log partial — one or more sources failed"
+                        message="Event log partial: one or more sources failed"
                         description={
                           <div>
                             <ul style={{ margin: '4px 0 4px 16px' }}>
                               {diagEventsError.errors.map((err, i) => (
                                 <li key={i}>
-                                  <strong>{err.section}</strong>: {err.exception_type} — {err.message}
+                                  <strong>{err.section}</strong>: {err.exception_type}: {err.message}
                                 </li>
                               ))}
                             </ul>
@@ -1359,7 +1931,7 @@ const ACMEAutomation = () => {
                           children: (
                             <div>
                               <div style={{ fontSize: 12, color: '#888' }}>{ev.created_at} · {ev.source}</div>
-                              <div><strong>{ev.event_type}</strong></div>
+                              <div><strong>{humanizeEventType(ev.event_type)}</strong></div>
                               {ev.message && <div>{ev.message}</div>}
                             </div>
                           ),

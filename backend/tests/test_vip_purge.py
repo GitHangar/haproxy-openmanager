@@ -42,6 +42,10 @@ def test_delete_endpoint_accepts_purge_package_default_off():
 
 
 def test_migration_adds_purge_column_and_bumps_schema():
+    import re
     s = _read("database/migrations.py")
     assert "purge_on_teardown BOOLEAN NOT NULL DEFAULT FALSE" in s
-    assert "SCHEMA_VERSION = 7" in s
+    # Schema was bumped to accommodate this column. Assert >= 7 (the version it landed in)
+    # rather than pinning an exact value, so later schema bumps don't re-break this test.
+    m = re.search(r"^SCHEMA_VERSION\s*=\s*(\d+)", s, re.MULTILINE)
+    assert m is not None and int(m.group(1)) >= 7
