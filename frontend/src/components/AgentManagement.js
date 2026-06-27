@@ -2378,7 +2378,7 @@ const AgentManagement = () => {
                         const element = document.createElement('a');
                         const file = new Blob([installScript], { type: 'text/plain' });
                         element.href = URL.createObjectURL(file);
-                        element.download = `install-haproxy-agent-${selectedPlatform}.sh`;
+                        element.download = `install-agent-${selectedPlatform}.sh`;
                         document.body.appendChild(element);
                         element.click();
                         document.body.removeChild(element);
@@ -2516,7 +2516,7 @@ const AgentManagement = () => {
                                     const element = document.createElement('a');
                                     const file = new Blob([uninstallScript], { type: 'text/plain' });
                                     element.href = URL.createObjectURL(file);
-                                    element.download = `uninstall-haproxy-agent-${selectedPlatform}.sh`;
+                                    element.download = `uninstall-agent-${selectedPlatform}.sh`;
                                     document.body.appendChild(element);
                                     element.click();
                                     document.body.removeChild(element);
@@ -3147,7 +3147,7 @@ const AgentManagement = () => {
                           const element = document.createElement('a');
                           const file = new Blob([deleteUninstallScript], { type: 'text/plain' });
                           element.href = URL.createObjectURL(file);
-                          element.download = `uninstall-haproxy-agent-${agentToDelete.platform || 'linux'}.sh`;
+                          element.download = `uninstall-agent-${agentToDelete.platform || 'linux'}.sh`;
                           document.body.appendChild(element);
                           element.click();
                           document.body.removeChild(element);

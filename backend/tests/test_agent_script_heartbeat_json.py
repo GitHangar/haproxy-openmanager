@@ -44,3 +44,18 @@ def test_b2_guard_precedes_every_fragment_system_info_use():
     for name, script in (("linux", LINUX), ("macos", MACOS)):
         assert script.count("    $system_info,") >= 1, f"{name}: fragment heartbeat form unexpectedly gone"
         assert script.count(_B2_GUARD) == 2, f"{name}: each fragment call site must carry the guard"
+
+
+def test_cleanup_does_not_self_kill_via_bare_haproxy_agent_pattern():
+    # Issue #31 (v1.8.4): the pre-installation cleanup kills processes by pgrep -f "$pattern". A bare
+    # "haproxy-agent" pattern also matches the installer's OWN path (install-haproxy-agent-*.sh) and a
+    # sudo/PAM ancestor, so the installer killed itself. The kill loop must target ONLY the installed
+    # agent (binary path + service/label), never the bare string.
+    for name, script in (("linux", LINUX), ("macos", MACOS)):
+        assert 'for pattern in "haproxy-agent"' not in script, (
+            f"{name}: pre-install cleanup uses the bare 'haproxy-agent' kill pattern -> self-kill (issue #31)"
+        )
+        # The narrowed, installer-safe pattern must be present (binary path via $INSTALL_DIR).
+        assert 'for pattern in "$INSTALL_DIR/haproxy-agent"' in script, (
+            f"{name}: cleanup must match the installed binary path, not a bare substring"
+        )

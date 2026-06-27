@@ -470,7 +470,12 @@ safe_remove() {
 [[ "$QUIET_MODE" != "true" ]] && echo "Terminating existing HAProxy Agent processes..."
 KILLED_COUNT=0
 INSTALLER_PID=$$
-for pattern in "haproxy-agent" "/usr/local/bin/haproxy-agent" "haproxy-agent.service"; do
+# issue #31: match ONLY the installed agent (binary path + service), never the bare string
+# "haproxy-agent". With pgrep -f, that bare string can also match the installer's OWN command line
+# or a sudo/PAM ancestor (which the $$/$PPID guard does not fully cover), making the cleanup kill
+# the installer itself ("Killed", install aborts). The systemd service is also stopped below; the
+# "$INSTALL_DIR/haproxy-agent" path still catches any running daemon.
+for pattern in "$INSTALL_DIR/haproxy-agent" "haproxy-agent.service"; do
     PIDS=$(pgrep -f "$pattern" 2>/dev/null || true)
     if [[ -n "$PIDS" ]]; then
         FILTERED=""
