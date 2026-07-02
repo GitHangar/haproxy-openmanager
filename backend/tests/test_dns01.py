@@ -110,3 +110,111 @@ def test_nonce_scoped_per_directory():
     assert got == "NONCE_A"                                            # returns THIS CA's nonce
     assert svc._nonce_by_dir.get("https://a.example/dir") is None      # consumed (single-use)
     assert svc._nonce_by_dir.get("https://b.example/dir") == "NONCE_B" # the other CA is untouched
+
+
+def _sql_paren_depth(sql: str):
+    """Parenthesis depth of a SQL string, counting only OUTSIDE '...' literals (with ''
+    escapes), `--` line comments and /* */ block comments. Single-pass state machine so a
+    `--` inside a literal or a `'` inside a comment cannot corrupt the count. Dollar-quoted
+    strings are out of scope (not used in this codebase). Returns (final_depth, min_depth).
+    """
+    depth = 0
+    min_depth = 0
+    state = "normal"
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+        if state == "normal":
+            if ch == "'":
+                state = "string"
+            elif ch == "-" and nxt == "-":
+                state = "line_comment"
+                i += 1
+            elif ch == "/" and nxt == "*":
+                state = "block_comment"
+                i += 1
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                min_depth = min(min_depth, depth)
+        elif state == "string":
+            if ch == "'":
+                if nxt == "'":
+                    i += 1  # escaped '' stays inside the literal
+                else:
+                    state = "normal"
+        elif state == "line_comment":
+            if ch == "\n":
+                state = "normal"
+        else:  # block_comment
+            if ch == "*" and nxt == "/":
+                state = "normal"
+                i += 1
+        i += 1
+    return depth, min_depth
+
+
+def test_acme_sql_parentheses_balanced():
+    """Issue #35 v1.8.5: the completion task's order-claim query shipped (v1.8.0-v1.8.4) with an
+    extra closing parenthesis, so EVERY 60s cycle died with `syntax error at or near ")"` and no
+    background ACME work (claim/finalize/download, DNS-01 publish, wizard-staged promotion,
+    retry, TXT cleanup) ever ran. The suite never caught it because the DB layer is mocked and
+    raw SQL never reaches a real parser. This guard scans the ACME modules' SQL string literals
+    for unbalanced parentheses.
+
+    Guard scope is deliberately conservative to avoid false positives on production changes:
+    keyword matching is case-sensitive (SQL is uppercase in this codebase; prose in docstrings
+    is not) and f-string fragments are excluded (they split at `{`, so a fragment may be
+    legitimately unbalanced).
+    """
+    import ast
+    import re
+
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    modules = [
+        "main.py",
+        os.path.join("services", "dns01_orchestrator.py"),
+        os.path.join("services", "acme_service.py"),
+        os.path.join("services", "letsencrypt_service.py"),
+        os.path.join("routers", "letsencrypt.py"),
+        os.path.join("routers", "acme_diagnostics.py"),
+    ]
+    problems = []
+    for rel in modules:
+        with open(os.path.join(backend_dir, rel), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        fstring_parts = {
+            id(const)
+            for joined in ast.walk(tree) if isinstance(joined, ast.JoinedStr)
+            for const in ast.walk(joined) if isinstance(const, ast.Constant)
+        }
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if id(node) in fstring_parts:
+                continue
+            sql = node.value
+            if not re.search(r"\b(SELECT|INSERT|UPDATE|DELETE)\b", sql):
+                continue
+            if not re.search(r"\b(FROM|INTO|SET|WHERE)\b", sql):
+                continue
+            depth, min_depth = _sql_paren_depth(sql)
+            if depth != 0 or min_depth < 0:
+                problems.append(f"{rel}:{node.lineno} (paren depth {depth:+d}, min {min_depth})")
+    assert not problems, f"Unbalanced parentheses in SQL literal(s): {problems}"
+
+
+def test_sql_paren_depth_scanner():
+    # The guard's scanner itself: parens in literals/comments must not count; '' escapes and
+    # block comments handled; an extra ')' is reported via min_depth even if a later '(' would
+    # re-balance the total.
+    assert _sql_paren_depth("SELECT (1)") == (0, 0)
+    assert _sql_paren_depth("SELECT (1))") == (-1, -1)                       # the v1.8.0 bug shape
+    assert _sql_paren_depth("SELECT ')' , '((' FROM t") == (0, 0)            # literals ignored
+    assert _sql_paren_depth("SELECT 'it''s ))' FROM t") == (0, 0)            # '' escape stays inside
+    assert _sql_paren_depth("SELECT 1 -- comment ) (\nFROM t") == (0, 0)     # line comment ignored
+    assert _sql_paren_depth("SELECT 1 /* ) */ FROM t") == (0, 0)             # block comment ignored
+    assert _sql_paren_depth("SELECT 'a--b' AND (x=1\n)") == (0, 0)           # -- inside literal is data
+    assert _sql_paren_depth("WHERE x) AND (y") == (0, -1)                    # net 0 but went negative

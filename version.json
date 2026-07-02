@@ -1,5 +1,5 @@
 {
-  "version": "1.8.4",
-  "releaseName": "Agent installer self-kill fix",
-  "releaseDate": "2026-06-27"
+  "version": "1.8.5",
+  "releaseName": "ACME completion-task SQL fix",
+  "releaseDate": "2026-07-03"
 }

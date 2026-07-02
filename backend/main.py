@@ -318,7 +318,6 @@ async def complete_pending_acme_orders():
                                     OR dns01_last_attempt_at < NOW() - (
                                         (CASE COALESCE(dns01_attempts, 0) WHEN 0 THEN 15 WHEN 1 THEN 30 ELSE 60 END)
                                         || ' minutes')::INTERVAL
-                                    )
                                 )
                             )
                         )
