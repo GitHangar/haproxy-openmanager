@@ -1695,9 +1695,13 @@ async def agent_heartbeat_by_name(
             """, x_api_key)
 
         # Check if agent was in upgrading status and version has changed
-        current_agent_status = await conn.fetchval("SELECT status FROM agents WHERE id = $1", agent_id)
-        current_agent_version = await conn.fetchval("SELECT version FROM agents WHERE id = $1", agent_id)
-        current_upgrade_status = await conn.fetchval("SELECT upgrade_status FROM agents WHERE id = $1", agent_id)
+        # (v1.8.6: one round-trip instead of three; row is None exactly when the
+        # per-column fetchvals would each have returned None)
+        current_agent_row = await conn.fetchrow(
+            "SELECT status, version, upgrade_status FROM agents WHERE id = $1", agent_id)
+        current_agent_status = current_agent_row['status'] if current_agent_row else None
+        current_agent_version = current_agent_row['version'] if current_agent_row else None
+        current_upgrade_status = current_agent_row['upgrade_status'] if current_agent_row else None
         
         # Determine new status - preserve upgrading status unless version actually changed
         new_status = current_agent_status or 'online'

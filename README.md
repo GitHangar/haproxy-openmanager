@@ -1738,6 +1738,19 @@ Add new HAProxy clusters through the web interface or directly via API:
 }
 ```
 
+### Performance Tuning *(v1.8.6)*
+
+The backend API defaults to a **single uvicorn worker process**, which uses one CPU core. Agents poll the API every 30 seconds (heartbeat, config, pending-requests, upgrade checks), so larger fleets add a constant baseline load. Two ways to scale:
+
+- **Docker Compose — worker processes**: set `UVICORN_WORKERS` in your `.env` (default `1`). On a multi-core host, matching the core count (e.g. `UVICORN_WORKERS=2` on a 2-core machine) lets the API use all cores:
+  ```bash
+  echo "UVICORN_WORKERS=2" >> .env && docker-compose up -d backend
+  ```
+- **Kubernetes/OpenShift — replicas**: the shipped manifests already include an HPA for the backend (2→10 replicas, `k8s/manifests/13-hpa.yaml`); raise `minReplicas`/`maxReplicas` as needed.
+
+Both are safe: all background tasks (ACME completion, renewals, agent monitoring) are multi-replica safe by design (atomic claims via `FOR UPDATE SKIP LOCKED`, PostgreSQL advisory locks).
+
+**Diagnosing slow requests**: every API response carries an `X-Response-Time` header, and the backend logs `Slow request detected` (WARNING) for any request taking longer than 1 second — check those log lines to pinpoint slow endpoints before tuning anything else.
 
 ## API Reference
 
@@ -2415,6 +2428,7 @@ Developed with ❤️ for the HAProxy community
 
 ## Release Notes
 
+- **v1.8.6** (2026-07-06) — **Performance: opt-in API workers + heartbeat micro-optimization** (Issue #35 follow-up): the backend container can now run multiple uvicorn worker processes via the new `UVICORN_WORKERS` environment variable (default **1** — behavior unchanged unless you opt in), letting the API use all cores on multi-core hosts; background tasks were already multi-replica safe, as exercised by the Kubernetes HPA deployment. The agent heartbeat handler now reads the agent's `status`/`version`/`upgrade_status` in one query instead of three (one round-trip per heartbeat, per agent, every 30s). Added a *Performance Tuning* section to the README (worker/replica scaling and how to use the `X-Response-Time` header and `Slow request detected` logs to pinpoint slow endpoints). Zero-risk release: no schema, API, or agent changes; defaults preserve existing behavior exactly.
 - **v1.8.5** (2026-07-03) — **ACME completion-task SQL fix** (Issue #35 follow-up): the background order-completion task (`complete_pending_acme_orders`, runs every 60s) died on **every cycle** with `syntax error at or near ")"` — an extra closing parenthesis introduced in v1.8.0's bounded DNS-01 retry claim query. Because that query is the task's first database call, **no background ACME work ran at all from v1.8.0 through v1.8.4**: orders were never claimed for finalize/download, the DNS-01 TXT record was never published (so DNS-01 with an automated provider such as Cloudflare could never validate), Site Wizard staged orders never left `wizard_staged`, and DNS-01 retry/TXT-cleanup never executed. The stray parenthesis is removed and a regression test now scans all ACME modules' SQL for unbalanced parentheses (the unit suite mocks the database, which is why a raw-SQL syntax error could slip through). One-line backend query fix; no schema, API, or agent changes — fully backward compatible.
 - **v1.8.4** (2026-06-27) — **Agent installer self-kill fix** (Issue #31): the Linux/macOS agent installer could abort during "pre-installation cleanup" (terminal showed `Killing processes matching: haproxy-agent` then `Killed`) when the install script's own filename contained "haproxy-agent". The cleanup killed processes by matching the bare string "haproxy-agent" against full command lines, which also matched the running installer (and a `sudo`/PAM ancestor the self-exclusion did not cover), so the installer terminated itself. Cleanup now targets only the installed agent (the `$INSTALL_DIR/haproxy-agent` binary and the agent service), never the bare string, and the UI now names the downloaded scripts `install-agent-<platform>.sh` / `uninstall-agent-<platform>.sh`. Installer-only change; the running agent and its privilege model (it runs as root for HAProxy reload, config writes, keepalived, and self-upgrade) are unchanged.
 - **v1.8.3** (2026-06-25) — **Agent heartbeat JSON fix** (Issue #31): a self-hosted agent could fail every heartbeat with `HTTP 400 Invalid JSON: Expecting property name enclosed in double quotes` when the system-info block it collects came back empty on an unusual host, leaving a stray comma in the hand-built heartbeat JSON. The agent script now substitutes a valid placeholder when that block is empty so it can no longer emit a stray comma, and the backend heartbeat endpoint now parses valid payloads as-is and, only when a body fails to parse, tolerates that specific malformed pattern (a leading or doubled comma) so an already-deployed agent recovers on its next heartbeat after this build is deployed. Backend + agent-script only; healthy agents of every version are byte-for-byte unaffected.

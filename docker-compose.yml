@@ -51,6 +51,9 @@ services:
       - LOG_LEVEL=INFO
       - PUBLIC_URL=http://localhost:8080
       - MANAGEMENT_BASE_URL=http://localhost:8080
+      # Empty when unset on the host: the image CMD then falls back to
+      # WEB_CONCURRENCY (uvicorn's native env) and finally to 1.
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-}
     volumes:
       - haproxy_configs:/etc/haproxy
     expose:
