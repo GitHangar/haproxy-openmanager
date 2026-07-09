@@ -81,7 +81,7 @@ jobs:
         run: |
           VERSION="${{ steps.prodversion.outputs.VERSION }}"
           TAG="v${VERSION}"
-          RELEASE_NAME=$(jq -r '.releaseName // empty' version.json)
+          RELEASE_NAME=$(jq -r '.releaseName // empty' backend/version.json)
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG already exists, skipping."
           else
