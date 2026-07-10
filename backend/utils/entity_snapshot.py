@@ -329,9 +329,10 @@ async def _rollback_update(
                     tcp_request_rules = $26, timeout_client = $27, timeout_http_request = $28,
                     rate_limit = $29, compression = $30, log_separate = $31,
                     monitor_uri = $32, maxconn = $33,
-                    cluster_id = $34, is_active = $35, last_config_status = $36, 
+                    cluster_id = $34, is_active = $35, last_config_status = $36,
+                    log_format = $37, filters = $38,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = $37
+                WHERE id = $39
             """,
                 old_values.get('name'),
                 old_values.get('bind_address'),
@@ -369,6 +370,8 @@ async def _rollback_update(
                 old_values.get('cluster_id'),
                 old_values.get('is_active'),
                 old_values.get('last_config_status'),
+                old_values.get('log_format'),  # Issue #38
+                old_values.get('filters'),     # Issue #38
                 entity_id
             )
             

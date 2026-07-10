@@ -85,6 +85,11 @@ class FrontendConfig(BaseModel):
     response_headers: Optional[str] = None
     options: Optional[str] = None
     tcp_request_rules: Optional[str] = None
+    # Issue #38: SPOE filter directives (Coraza WAF etc.) + frontend log-format.
+    # Passthrough TEXT (no validator) — SPOE `filter ... config <path>` legitimately
+    # references an operator-managed file, so the ACL `-f` guard must NOT apply here.
+    log_format: Optional[str] = None
+    filters: Optional[str] = None
     timeout_client: Optional[int] = None
     timeout_http_request: Optional[int] = None
     rate_limit: Optional[int] = None

@@ -458,6 +458,8 @@ backend web-backend
           {record.request_headers && <Tag color="blue">Req Headers</Tag>}
           {record.response_headers && <Tag color="green">Resp Headers</Tag>}
           {record.tcp_request_rules && <Tag color="purple">TCP Rules</Tag>}
+          {record.filters && <Tag color="magenta">Filters</Tag>}
+          {record.log_format && <Tag color="geekblue">Log Format</Tag>}
           {record.acl_rules && record.acl_rules.length > 0 && <Tag color="orange">{record.acl_rules.length} ACLs</Tag>}
           {record.use_backend_rules && record.use_backend_rules.length > 0 && <Tag color="cyan">{record.use_backend_rules.length} Routes</Tag>}
         </Space>
@@ -1076,8 +1078,9 @@ backend web-backend
                         size="small"
                         expandable={{
                           expandedRowRender: (frontend) => {
-                            const hasDetails = frontend.request_headers || frontend.response_headers || 
-                                             frontend.options || frontend.tcp_request_rules || 
+                            const hasDetails = frontend.request_headers || frontend.response_headers ||
+                                             frontend.options || frontend.tcp_request_rules ||
+                                             frontend.filters || frontend.log_format ||
                                              (frontend.acl_rules && frontend.acl_rules.length > 0) ||
                                              (frontend.use_backend_rules && frontend.use_backend_rules.length > 0);
                             
@@ -1157,9 +1160,49 @@ backend web-backend
                                         </span>
                                       }
                                     >
-                                      <MultiLineDiffRenderer 
+                                      <MultiLineDiffRenderer
                                         value={frontend.tcp_request_rules}
                                         changeInfo={frontend._changes?.tcp_request_rules}
+                                      />
+                                    </Descriptions.Item>
+                                  )}
+                                  {/* Issue #38: SPOE filters */}
+                                  {frontend.filters && (
+                                    <Descriptions.Item
+                                      label={
+                                        <span>
+                                          Filters (SPOE/WAF)
+                                          {frontend._changes?.filters && (
+                                            <Tag color="green" style={{ marginLeft: 8, fontSize: '10px' }}>
+                                              {frontend._changes.filters.old ? 'CHANGED' : 'NEW'}
+                                            </Tag>
+                                          )}
+                                        </span>
+                                      }
+                                    >
+                                      <MultiLineDiffRenderer
+                                        value={frontend.filters}
+                                        changeInfo={frontend._changes?.filters}
+                                      />
+                                    </Descriptions.Item>
+                                  )}
+                                  {/* Issue #38: frontend log-format */}
+                                  {frontend.log_format && (
+                                    <Descriptions.Item
+                                      label={
+                                        <span>
+                                          Log Format
+                                          {frontend._changes?.log_format && (
+                                            <Tag color="green" style={{ marginLeft: 8, fontSize: '10px' }}>
+                                              {frontend._changes.log_format.old ? 'CHANGED' : 'NEW'}
+                                            </Tag>
+                                          )}
+                                        </span>
+                                      }
+                                    >
+                                      <MultiLineDiffRenderer
+                                        value={frontend.log_format}
+                                        changeInfo={frontend._changes?.log_format}
                                       />
                                     </Descriptions.Item>
                                   )}

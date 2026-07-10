@@ -3696,17 +3696,19 @@ async def confirm_restore_config_version(
                     # UPDATE existing frontend (ALL 8 parsed fields)
                     # CRITICAL FIX: Include maxconn and timeout_client so UI shows restored values
                     await conn.execute("""
-                        UPDATE frontends 
-                        SET bind_address = $1, bind_port = $2, default_backend = $3, 
+                        UPDATE frontends
+                        SET bind_address = $1, bind_port = $2, default_backend = $3,
                             mode = $4, ssl_enabled = $5, ssl_port = $6,
                             maxconn = $7, timeout_client = $8,
+                            log_format = $11, filters = $12,
                             updated_at = CURRENT_TIMESTAMP, last_config_status = 'PENDING'
                         WHERE id = $9 AND cluster_id = $10
-                    """, 
+                    """,
                         parsed_fe.bind_address, parsed_fe.bind_port, parsed_fe.default_backend,
                         parsed_fe.mode, parsed_fe.ssl_enabled, parsed_fe.ssl_port,
                         parsed_fe.maxconn, parsed_fe.timeout_client,
-                        fe_id, cluster_id
+                        fe_id, cluster_id,
+                        parsed_fe.log_format, parsed_fe.filters  # Issue #38
                     )
                     changes_summary["frontends_updated"] += 1
                     logger.info(f"RESTORE: Updated frontend '{parsed_fe.name}' (SSL: {parsed_fe.ssl_enabled}, maxconn: {parsed_fe.maxconn})")
@@ -3714,16 +3716,17 @@ async def confirm_restore_config_version(
                     # CREATE new frontend (ALL 8 parsed fields)
                     # CRITICAL FIX: Include maxconn and timeout_client so UI shows restored values
                     await conn.execute("""
-                        INSERT INTO frontends 
+                        INSERT INTO frontends
                         (name, bind_address, bind_port, default_backend, mode, ssl_enabled, ssl_port,
                          maxconn, timeout_client,
-                         cluster_id, is_active, last_config_status, created_at, updated_at)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """, 
+                         cluster_id, log_format, filters, is_active, last_config_status, created_at, updated_at)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, TRUE, 'PENDING', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    """,
                         parsed_fe.name, parsed_fe.bind_address, parsed_fe.bind_port,
                         parsed_fe.default_backend, parsed_fe.mode, parsed_fe.ssl_enabled, parsed_fe.ssl_port,
                         parsed_fe.maxconn, parsed_fe.timeout_client,
-                        cluster_id
+                        cluster_id,
+                        parsed_fe.log_format, parsed_fe.filters  # Issue #38
                     )
                     changes_summary["frontends_created"] += 1
                     logger.info(f"RESTORE: Created frontend '{parsed_fe.name}' (SSL: {parsed_fe.ssl_enabled}, maxconn: {parsed_fe.maxconn})")

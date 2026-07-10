@@ -855,6 +855,9 @@ async def parse_bulk_config(
                 "response_headers": frontend.response_headers,
                 "options": frontend.options,
                 "tcp_request_rules": frontend.tcp_request_rules,
+                # Issue #38: SPOE filters + frontend log-format
+                "log_format": frontend.log_format,
+                "filters": frontend.filters,
                 # CRITICAL: SSL Advanced Options (parsed from bind directive)
                 "ssl_alpn": frontend.ssl_alpn,
                 "ssl_npn": frontend.ssl_npn,
@@ -1089,7 +1092,50 @@ async def parse_bulk_config(
         
         # Add auto-assignment info at the beginning
         enhanced_warnings = ssl_auto_assign_info + enhanced_warnings
-        
+
+        # ─────────────────────────────────────────────────────────────────
+        # Issue #38: SPOE pre-flight advisories. Surface, at preview time, the
+        # SPOE configurations that would FAIL HAProxy's `haproxy -c` at apply so
+        # the operator sees them BEFORE importing. Cluster-aware: the referenced
+        # SPOE engine config (e.g. coraza.cfg) is a sibling of the cluster's
+        # haproxy_config_path, which HAProxy OpenManager does not provision.
+        # ─────────────────────────────────────────────────────────────────
+        try:
+            _cfg_path = await conn.fetchval(
+                "SELECT haproxy_config_path FROM haproxy_clusters WHERE id = $1",
+                request.cluster_id,
+            ) or "/etc/haproxy/haproxy.cfg"
+            _cfg_dir = _cfg_path.rsplit("/", 1)[0] or "/etc/haproxy"
+            for _fe in frontends_data:
+                _rh = _fe.get("request_headers") or ""
+                _filters = _fe.get("filters") or ""
+                # engines declared by `filter spoe engine <name> config <path>`
+                _declared_engines = set(re.findall(
+                    r"filter\s+spoe\s+engine\s+(\S+)", _filters, re.IGNORECASE))
+                # engines referenced by `... send-spoe-group <name> <group>`
+                _used_engines = set(re.findall(
+                    r"send-spoe-group\s+(\S+)", _rh, re.IGNORECASE))
+                _missing = _used_engines - _declared_engines
+                if _missing:
+                    enhanced_warnings.append(
+                        f"⚠️ Frontend '{_fe['name']}': 'send-spoe-group' references SPOE "
+                        f"engine(s) {', '.join(sorted(_missing))} but no matching "
+                        f"'filter spoe engine <name> ...' line was found. HAProxy will "
+                        f"reject this at apply with \"unable to find SPOE engine\". Add the "
+                        f"filter line to this frontend."
+                    )
+                for _path in re.findall(
+                        r"filter\s+spoe\s+engine\s+\S+\s+config\s+(\S+)",
+                        _filters, re.IGNORECASE):
+                    enhanced_warnings.append(
+                        f"ℹ️ Frontend '{_fe['name']}': SPOE engine config '{_path}' and its "
+                        f"SPOA backend must exist on the HAProxy host (cluster config dir: "
+                        f"{_cfg_dir}). HAProxy OpenManager preserves the filter directive but "
+                        f"does not provision these files; otherwise 'haproxy -c' fails at apply."
+                    )
+        except Exception as _spoe_adv_err:
+            logger.warning(f"SPOE advisory generation skipped: {_spoe_adv_err}")
+
         # BULK IMPORT MVP: Check existing entities for UPSERT detection
         # Mark each entity as new or update for UI display
         # CRITICAL: Only mark as UPDATE if there are actual field changes
@@ -1150,7 +1196,17 @@ async def parse_bulk_config(
                 if frontend.get("tcp_request_rules") and frontend["tcp_request_rules"] != existing["tcp_request_rules"]:
                     has_changes = True
                     changes["tcp_request_rules"] = {"old": existing["tcp_request_rules"], "new": frontend["tcp_request_rules"]}
-                
+                # Issue #38: SPOE filters + log-format change detection. REQUIRED for
+                # persistence (not just display): without it, an import that only adds
+                # a `filter`/`log-format` to an existing frontend would be flagged
+                # "no change" and the directive would never be written to the DB.
+                if frontend.get("log_format") and frontend["log_format"] != existing.get("log_format"):
+                    has_changes = True
+                    changes["log_format"] = {"old": existing.get("log_format"), "new": frontend["log_format"]}
+                if frontend.get("filters") and frontend["filters"] != existing.get("filters"):
+                    has_changes = True
+                    changes["filters"] = {"old": existing.get("filters"), "new": frontend["filters"]}
+
                 # CRITICAL: SSL Advanced Options change detection
                 if frontend.get("ssl_alpn") is not None and frontend.get("ssl_alpn") != existing.get("ssl_alpn"):
                     has_changes = True
@@ -2094,7 +2150,18 @@ async def bulk_create_entities(
                         update_fields.append(f"options = ${param_index}")
                         update_values.append(frontend_data["options"])
                         param_index += 1
-                    
+
+                    # Issue #38: SPOE filters + frontend log-format (merge strategy)
+                    if frontend_data.get("log_format") and frontend_data["log_format"] != existing_full.get("log_format"):
+                        update_fields.append(f"log_format = ${param_index}")
+                        update_values.append(frontend_data["log_format"])
+                        param_index += 1
+
+                    if frontend_data.get("filters") and frontend_data["filters"] != existing_full.get("filters"):
+                        update_fields.append(f"filters = ${param_index}")
+                        update_values.append(frontend_data["filters"])
+                        param_index += 1
+
                     # CRITICAL FIX: Update SSL advanced options (alpn, npn, ciphers, etc.)
                     # These are parsed from bind directive and should be preserved in database
                     if "ssl_alpn" in frontend_data and frontend_data.get("ssl_alpn") != existing_full.get("ssl_alpn"):
@@ -2214,9 +2281,10 @@ async def bulk_create_entities(
                             timeout_client, timeout_http_request, maxconn,
                             request_headers, response_headers, tcp_request_rules, options,
                             rate_limit, compression, log_separate, monitor_uri,
-                            cluster_id, acl_rules, use_backend_rules, redirect_rules, updated_at
-                        ) 
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, CURRENT_TIMESTAMP) 
+                            cluster_id, acl_rules, use_backend_rules, redirect_rules,
+                            log_format, filters, updated_at
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, CURRENT_TIMESTAMP)
                         RETURNING id
                     """, 
                         frontend_data["name"],
@@ -2257,7 +2325,9 @@ async def bulk_create_entities(
                         request.cluster_id,
                         json.dumps(frontend_data.get("acl_rules", [])),  # acl_rules
                         json.dumps(frontend_data.get("use_backend_rules", [])),  # use_backend_rules
-                        json.dumps([])   # redirect_rules
+                        json.dumps([]),   # redirect_rules
+                        frontend_data.get("log_format"),  # Issue #38
+                        frontend_data.get("filters")      # Issue #38
                     )
                     
                     created_entities["frontends"].append({

@@ -105,6 +105,11 @@ class ParsedFrontend:
     response_headers: Optional[str] = None
     options: Optional[str] = None  # HAProxy frontend options (option httplog, option forwardfor, etc.)
     tcp_request_rules: Optional[str] = None  # TCP request directives (for TCP mode)
+    # Issue #38: SPOE (and other) filter directives + frontend log-format.
+    # Stored as full directive lines; `filters` is newline-joined to preserve
+    # ordering when multiple `filter ...` lines exist.
+    log_format: Optional[str] = None  # `log-format` / `log-format-sd` line(s)
+    filters: Optional[str] = None  # `filter ...` line(s), e.g. `filter spoe engine coraza config ...`
 
 
 @dataclass
@@ -256,8 +261,23 @@ class HAProxyConfigParser:
             acl_rules_list = []
             use_backend_rules_list = []
             tcp_request_rules_list = []
+            filters_list = []
+            log_format_list = []
 
             for line in lines:
+                # Issue #38: capture `filter ...` (SPOE/Coraza etc.) and
+                # `log-format`/`log-format-sd` directives. Pre-fix these matched
+                # no branch below and were silently dropped, so an imported SPOE
+                # config lost `filter spoe engine coraza ...` (→ HAProxy fatal
+                # "unable to find SPOE engine") and the frontend log-format.
+                # `continue` isolates them from the header/option handling below.
+                if line.startswith('filter '):
+                    filters_list.append(line.strip())
+                    continue
+                if re.match(r'^log-format(-sd)?\s', line, re.IGNORECASE):
+                    log_format_list.append(line.strip())
+                    continue
+
                 # Parse bind directive
                 # IMPORTANT: Handle multiple bind lines correctly
                 # Example: bind *:1002 (HTTP) and bind *:443 ssl (HTTPS)
@@ -540,6 +560,13 @@ class HAProxyConfigParser:
             if tcp_request_rules_list:
                 frontend.tcp_request_rules = '\n'.join(tcp_request_rules_list)
 
+            # Issue #38: assign captured SPOE filters + log-format
+            if filters_list:
+                frontend.filters = '\n'.join(filters_list)
+
+            if log_format_list:
+                frontend.log_format = '\n'.join(log_format_list)
+
             self.frontends.append(frontend)
             logger.info(f"Parsed frontend: {name} -> {frontend.default_backend}")
 
@@ -666,9 +693,14 @@ class HAProxyConfigParser:
                             'transparent', 'abortonclose', 'allbackups', 'checkcache', 'clitcpka',
                             'srvtcpka', 'http-no-delay', 'socket-stats', 'tcp-smart-accept',
                             'tcp-smart-connect', 'independant-streams', 'log-separate-errors',
-                            'log-health-checks', 'accept-invalid-http-request', 'accept-invalid-http-response'
+                            'log-health-checks', 'accept-invalid-http-request', 'accept-invalid-http-response',
+                            # Issue #38: SPOP health check for SPOE agent backends
+                            # (e.g. coraza-spoa). Already collected below regardless, but
+                            # listing it suppresses the spurious "unknown option" warning
+                            # for the exact SPOE use-case.
+                            'spop-check'
                         ]
-                        
+
                         if option_name not in valid_options:
                             # Unknown/invalid option - add warning but still collect it
                             self.warnings.append(

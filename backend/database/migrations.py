@@ -194,7 +194,14 @@ async def ensure_agents_table():
             'use_backend_rules': "ALTER TABLE frontends ADD COLUMN use_backend_rules JSONB DEFAULT '[]'::jsonb;",
             'request_headers': "ALTER TABLE frontends ADD COLUMN request_headers TEXT;",
             'response_headers': "ALTER TABLE frontends ADD COLUMN response_headers TEXT;",
-            'maxconn': "ALTER TABLE frontends ADD COLUMN maxconn INTEGER;"
+            'maxconn': "ALTER TABLE frontends ADD COLUMN maxconn INTEGER;",
+            # Issue #38: SPOE filter directives (e.g. Coraza WAF) and frontend
+            # log-format were silently dropped on bulk-import / manual edit
+            # because the parser recognised only a fixed set of directives.
+            # These nullable TEXT columns persist them verbatim (multi-line for
+            # `filters`), mirroring the request_headers/options passthrough.
+            'log_format': "ALTER TABLE frontends ADD COLUMN log_format TEXT;",
+            'filters': "ALTER TABLE frontends ADD COLUMN filters TEXT;"
         }
         
         for col, query in frontend_columns.items():
@@ -1741,7 +1748,12 @@ async def ensure_agent_activity_logs_table():
 # columns on letsencrypt_accounts/letsencrypt_orders/acme_challenges and the brand-new
 # letsencrypt_account_dns_credentials table (ensure_letsencrypt_dns_credentials step).
 # All additive + idempotent; default challenge_type 'http-01' keeps existing flows byte-identical.
-SCHEMA_VERSION = 8
+# v1.8.8 (Issue #38 — SPOE filter + frontend log-format): bumped 8 -> 9 for the additive
+# `log_format` + `filters` TEXT columns on `frontends` (frontend_columns loop). Without this
+# bump, already-deployed databases (version >= 8) skip the whole migration run and never gain
+# the columns, so the frontends SELECT/INSERT would fail. Additive + idempotent + nullable;
+# existing rows stay NULL and render byte-identical.
+SCHEMA_VERSION = 9
 
 
 async def run_all_migrations():

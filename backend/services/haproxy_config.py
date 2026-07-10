@@ -393,6 +393,12 @@ def _categorize_haproxy_directive(line: str) -> str:
         return "prelude"
     if s.startswith("acl "):
         return "acl"
+    # Issue #38: SPOE (and other) `filter` directives must be declared BEFORE
+    # the `http-request send-spoe-group` rules that use them, otherwise HAProxy
+    # fails with "unable to find SPOE engine". Own bucket, flushed right after
+    # `prelude` and before tcp_req/acl/http_req (see flush order below).
+    if s.startswith("filter "):
+        return "filter"
     if s.startswith("stick-table") or s.startswith("stick "):
         return "stick"
     if s.startswith("tcp-request"):
@@ -414,6 +420,7 @@ def _categorize_haproxy_directive(line: str) -> str:
         or s.startswith("compression ")
         or s.startswith("monitor-uri")
         or s.startswith("log ")
+        or s.startswith("log-format")  # Issue #38: log-format / log-format-sd
         or s.startswith("description ")
         or s.startswith("disabled")
         or s.startswith("enabled")
@@ -903,7 +910,7 @@ async def generate_haproxy_config_for_cluster(cluster_id: int, conn: Optional[An
             # "stick-table already declared").
             # ─────────────────────────────────────────────────────────────────
             _fe_buckets: Dict[str, List[str]] = {
-                "prelude": [], "stick": [], "tcp_req": [],
+                "prelude": [], "filter": [], "stick": [], "tcp_req": [],
                 "acl": [], "http_req": [], "http_resp": [],
                 "redirect": [], "use_be": [], "default_be": [],
             }
@@ -995,6 +1002,17 @@ async def generate_haproxy_config_for_cluster(cluster_id: int, conn: Optional[An
                     line_stripped = line.strip()
                     if line_stripped and line_stripped not in ('[]', '{}', 'null', 'None'):
                         _emit_fe(f"    {line_stripped}")
+
+            # Issue #38: emit frontend log-format and SPOE (etc.) filter directives.
+            # `log_format` routes to the `prelude` bucket, `filters` to the `filter`
+            # bucket (both via _emit_fe → _categorize_haproxy_directive), guaranteeing
+            # `filter ...` is rendered before the `http-request send-spoe-group` rules.
+            for _fld in ('log_format', 'filters'):
+                if frontend.get(_fld):
+                    for line in frontend[_fld].split('\n'):
+                        line_stripped = line.strip()
+                        if line_stripped and line_stripped not in ('[]', '{}', 'null', 'None'):
+                            _emit_fe(f"    {line_stripped}")
 
             # CRITICAL: Validate frontend-backend mode compatibility
             if frontend.get('default_backend'):
@@ -1223,6 +1241,7 @@ async def generate_haproxy_config_for_cluster(cluster_id: int, conn: Optional[An
             # ─────────────────────────────────────────────────────────────
             for _bucket_key in (
                 "prelude",
+                "filter",
                 "stick",
                 "tcp_req",
                 "acl",

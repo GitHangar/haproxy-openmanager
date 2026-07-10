@@ -56,14 +56,14 @@ async def create_frontend_row(
             acl_rules, redirect_rules, use_backend_rules,
             request_headers, response_headers, options, tcp_request_rules, timeout_client, timeout_http_request,
             rate_limit, compression, log_separate, monitor_uri,
-            cluster_id, maxconn, updated_at
+            cluster_id, maxconn, log_format, filters, updated_at
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
             $13, $14, $15, $16, $17, $18, $19,
             $20, $21, $22,
             $23, $24, $25, $26, $27, $28,
             $29, $30, $31, $32,
-            $33, $34, CURRENT_TIMESTAMP
+            $33, $34, $35, $36, CURRENT_TIMESTAMP
         )
         RETURNING id
         """,
@@ -101,6 +101,8 @@ async def create_frontend_row(
         getattr(payload, "monitor_uri", None),
         cluster_id,
         getattr(payload, "maxconn", None),
+        getattr(payload, "log_format", None),  # Issue #38
+        getattr(payload, "filters", None),     # Issue #38
     )
 
     if mark_pending:

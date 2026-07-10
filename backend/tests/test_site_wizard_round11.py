@@ -276,14 +276,16 @@ def test_categorize_routes_directives_correctly():
 
 def test_emit_buckets_flushed_in_canonical_order():
     """The flush block at end of frontend processing must list buckets
-    in: prelude → stick → tcp_req → acl → http_req → http_resp →
+    in: prelude → filter → stick → tcp_req → acl → http_req → http_resp →
     redirect → use_be → default_be. Pre-fix `http-request` rules
     interleaved with `use_backend` rules in source order, producing
-    HAProxy parser warnings."""
+    HAProxy parser warnings. (Issue #38 added the `filter` bucket, flushed
+    right after `prelude` so SPOE `filter` lines precede `send-spoe-group`.)"""
     src = _gen_src()
     flush_match = re.search(
         r'for\s+_bucket_key\s+in\s+\(\s*'
         r'"prelude"\s*,\s*'
+        r'"filter"\s*,\s*'
         r'"stick"\s*,\s*'
         r'"tcp_req"\s*,\s*'
         r'"acl"\s*,\s*'

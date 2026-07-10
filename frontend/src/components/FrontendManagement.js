@@ -642,7 +642,11 @@ const FrontendManagement = () => {
       // Explicitly set options field to handle null/undefined case (NEW field)
       options: frontend.options || '',
       // BUGFIX: Explicitly set tcp_request_rules field to handle null/undefined case
-      tcp_request_rules: frontend.tcp_request_rules || ''
+      tcp_request_rules: frontend.tcp_request_rules || '',
+      // Issue #38: SPOE filters + frontend log-format (null → '' so the
+      // TextAreas populate on edit and round-trip on save, preventing null-wipe)
+      log_format: frontend.log_format || '',
+      filters: frontend.filters || ''
     });
     
     // Update SSL field visibility after setting values
@@ -2246,6 +2250,40 @@ option http-keep-alive`}
 tcp-request inspect-delay 5s
 tcp-request content accept if { req_ssl_hello_type 1 }
 tcp-request connection reject if { src -f /etc/haproxy/blacklist.lst }`}
+                    />
+                  </Form.Item>
+                </Col>
+              </Row>
+
+              {/* Issue #38: SPOE filters + frontend log-format */}
+              <Row gutter={16}>
+                <Col span={24}>
+                  <Form.Item
+                    name="filters"
+                    label="Filters (SPOE / WAF)"
+                    extra="HAProxy filter directives (one per line). Emitted before send-spoe-group rules."
+                    tooltip="e.g. Coraza WAF via SPOE. The referenced engine config file and its SPOA backend must exist on the HAProxy host."
+                  >
+                    <TextArea
+                      rows={3}
+                      placeholder={`Examples:
+filter spoe engine coraza config /etc/haproxy/coraza.cfg`}
+                    />
+                  </Form.Item>
+                </Col>
+              </Row>
+
+              <Row gutter={16}>
+                <Col span={24}>
+                  <Form.Item
+                    name="log_format"
+                    label="Custom Log Format"
+                    extra="HAProxy log-format / log-format-sd directive (kept verbatim)"
+                    tooltip="Overrides option httplog/tcplog. Use the full directive including the quoted format string."
+                  >
+                    <TextArea
+                      rows={3}
+                      placeholder={'log-format "%ci:%cp [%t] %ft %b/%s %ST %B %{+Q}r"'}
                     />
                   </Form.Item>
                 </Col>
