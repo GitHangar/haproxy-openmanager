@@ -53,19 +53,19 @@ const MATCH_TYPE_GROUPS = [
   { label: 'Advanced', options: MATCH_TYPES.filter(m => m.category === 'Advanced') },
 ];
 
-// Phase K Phase D follow-up (Bulgu #12 round 3) — the `-f <file>`
-// flag was removed from the visual builder because HAProxy OpenManager
-// does not provision pattern files onto the HAProxy node filesystem.
-// Allowing `-f` in the visual builder produced ACL rules that passed
-// every UI / Pydantic / heuristic check but ALWAYS failed HAProxy's
-// real `-c` parse at apply time with "failed to open pattern file".
-// Operators reported a multi-page wizard run ending at the Apply
-// Management red-badge for a footgun the UI made trivial to step on.
-// The Pydantic validators on the manual API + wizard reject `-f`
-// universally; the visual builder simply removes the option from the
-// dropdown so operators cannot author the unsupported state.
+// Issue #38 follow-up — `-f <file>` is back in the visual builder:
+// the Bulgu #12 removal (and the matching Pydantic rejects) assumed a
+// missing pattern file would surprise the operator at apply time, but
+// the agent runs `haproxy -c` before every reload so a missing file
+// fails safely (previous config keeps running), and bulk import plus
+// the free-form fields always accepted `-f`. Pattern files are
+// operator-managed host files, same policy as SPOE filter configs
+// (v1.8.8). The value field carries the file path (e.g. flag `-f`
+// + value `/etc/haproxy/blacklist.lst`); an informational note is
+// rendered on rules that use it.
 const FLAGS = [
   { value: '-i', label: '-i  (case insensitive)' },
+  { value: '-f', label: '-f  (pattern file on host)' },
   { value: '-m beg', label: '-m beg  (begins with)' },
   { value: '-m end', label: '-m end  (ends with)' },
   { value: '-m sub', label: '-m sub  (contains)' },
@@ -396,25 +396,23 @@ function ACLDefinitionCard({ rule, index, onChange, onDelete }) {
   };
   const isRaw = rule.raw !== undefined;
 
-  // Phase K Phase D follow-up (Bulgu #12 round 3) — surface `-f` flag
-  // usage inline. The Pydantic validator rejects the rule server-side,
-  // but operators benefit from seeing the error AS they type / when
-  // they re-open a draft that carries a `-f`-flagged rule (e.g. from
-  // a pre-fix draft). The error message matches the Pydantic error
-  // verbatim so support flows are consistent.
+  // Issue #38 follow-up — `-f <file>` pattern-file references are
+  // ACCEPTED now (the Bulgu #12 reject was removed server-side too).
+  // We still detect them, but only to render an informational note:
+  // the referenced file is operator-managed and must exist on every
+  // HAProxy host; a missing file fails safely at the agent's
+  // pre-reload `haproxy -c`.
   const rawHasFileFlag = isRaw && typeof rule.raw === 'string' && ACL_FILE_FLAG_PATTERN.test(rule.raw);
   const structuredHasFileFlag =
     !isRaw && Array.isArray(rule.flags) && rule.flags.includes('-f');
   const hasFileFlag = rawHasFileFlag || structuredHasFileFlag;
-  const cardStyleWithError = hasFileFlag
-    ? { ...ruleCardStyle, border: `1px solid ${token.colorError}` }
-    : ruleCardStyle;
+  const cardStyleWithError = ruleCardStyle;
   const FILE_FLAG_TOOLTIP =
-    "ACL pattern-file references (-f <file>) are not supported by "
-    + "HAProxy OpenManager: the product does not provision pattern "
-    + "files onto the HAProxy node filesystem, so the reference "
-    + "would fail at HAProxy reload time. Remove '-f' and use inline "
-    + "values instead.";
+    "This rule references a pattern file (-f <file>). The file must "
+    + "exist at that exact path on every HAProxy host in the cluster — "
+    + "HAProxy OpenManager does not create or distribute pattern files. "
+    + "A missing file fails safely at 'haproxy -c' (the previous config "
+    + "keeps running).";
 
   if (isRaw) {
     return (
@@ -427,11 +425,10 @@ function ACLDefinitionCard({ rule, index, onChange, onDelete }) {
                 onChange={(e) => onChange(index, { raw: e.target.value })}
                 placeholder="Raw ACL rule (e.g. my_acl path_beg /api)"
                 prefix={<Tag color="default" style={{ marginRight: 4 }}>RAW</Tag>}
-                status={hasFileFlag ? 'error' : undefined}
               />
             </Tooltip>
             {hasFileFlag && (
-              <Text type="danger" style={{ fontSize: 11, display: 'block', marginTop: 2 }}>
+              <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 2 }}>
                 {FILE_FLAG_TOOLTIP}
               </Text>
             )}
@@ -549,12 +546,11 @@ function ACLDefinitionCard({ rule, index, onChange, onDelete }) {
                 onChange={(e) => onChange(index, { ...rule, value: e.target.value })}
                 placeholder={matchDef?.placeholder || 'Value'}
                 size="small"
-                status={structuredHasFileFlag ? 'error' : undefined}
               />
             );
           })()}
           {structuredHasFileFlag && (
-            <Text type="danger" style={{ fontSize: 11, display: 'block', marginTop: 2 }}>
+            <Text type="secondary" style={{ fontSize: 11, display: 'block', marginTop: 2 }}>
               {FILE_FLAG_TOOLTIP}
             </Text>
           )}
@@ -891,11 +887,11 @@ export default function ACLRuleBuilder({ aclRules = [], useBackendRules = [], re
       .map(d => d.name);
   }, [aclDefs]);
 
-  // Phase K Phase D follow-up (Bulgu #12 round 3) — count rules that
-  // still carry the unsupported `-f <file>` flag. Surfaced as a
-  // section-level Alert so operators know the section as a whole
-  // has invalid rules even if individual cards / raw text would
-  // otherwise need scrolling to find them.
+  // Issue #38 follow-up — count rules that reference a `-f <file>`
+  // pattern file. Surfaced as a section-level informational Alert
+  // (non-blocking): the file is operator-managed and must exist on
+  // every HAProxy host; a missing file fails safely at the agent's
+  // pre-reload `haproxy -c`.
   const fileFlagRuleCount = useMemo(() => {
     let count = 0;
     for (const d of aclDefs) {
@@ -1153,19 +1149,19 @@ export default function ACLRuleBuilder({ aclRules = [], useBackendRules = [], re
           Define named conditions to match incoming requests by path, header, source IP, and more.
         </Text>
 
-        {/* Phase K Phase D follow-up (Bulgu #12 round 3) — section-
-            level warning when one or more rules still carry the
-            unsupported `-f <file>` pattern-file flag. Render as a
-            blocking-style Alert so the operator notices BEFORE
-            Submit. The Pydantic validator rejects the same shape
-            server-side; this is the up-front authoring guardrail. */}
+        {/* Issue #38 follow-up — section-level informational note
+            when one or more rules reference `-f <file>` pattern
+            files. Non-blocking: pattern files are operator-managed
+            host files (the Bulgu #12 reject was removed) and a
+            missing file fails safely at the agent's pre-reload
+            `haproxy -c`. */}
         {fileFlagRuleCount > 0 && (
           <Alert
-            type="error"
+            type="info"
             showIcon
             style={{ marginBottom: 8 }}
-            message={`${fileFlagRuleCount} ACL rule${fileFlagRuleCount === 1 ? '' : 's'} use the unsupported \`-f <file>\` flag`}
-            description="HAProxy OpenManager does not provision pattern files onto the HAProxy node filesystem, so any `-f /path/...` reference would fail HAProxy reload at apply time with 'failed to open pattern file'. Remove the `-f` flag and switch to inline values (e.g. `src 10.0.0.0/24` instead of `src -f /etc/haproxy/admins.lst`)."
+            message={`${fileFlagRuleCount} ACL rule${fileFlagRuleCount === 1 ? '' : 's'} reference a \`-f <file>\` pattern file`}
+            description="The referenced file must exist at that exact path on every HAProxy host in the cluster — HAProxy OpenManager does not create or distribute pattern files. A missing file fails safely at 'haproxy -c' (the previous config keeps running)."
           />
         )}
 

@@ -1133,6 +1133,25 @@ async def parse_bulk_config(
                         f"{_cfg_dir}). HAProxy OpenManager preserves the filter directive but "
                         f"does not provision these files; otherwise 'haproxy -c' fails at apply."
                     )
+                # Issue #38 follow-up: ACL `-f <file>` pattern-file advisory.
+                # Scan only the structured rule fields (acl/use_backend) —
+                # request_headers/tcp_request_rules were always free-form and
+                # warning on them now would add new noise for existing users.
+                _pattern_paths = []
+                for _rule in (_fe.get("acl_rules") or []) + (_fe.get("use_backend_rules") or []):
+                    if isinstance(_rule, str):
+                        _pattern_paths.extend(
+                            re.findall(r"(?:^|\s)-f\s+(\S+)", _rule))
+                if _pattern_paths:
+                    _uniq = sorted(set(_pattern_paths))
+                    enhanced_warnings.append(
+                        f"ℹ️ Frontend '{_fe['name']}': ACL/routing rules reference pattern "
+                        f"file(s) {', '.join(_uniq)}. Each file must exist at that exact path "
+                        f"on every HAProxy host in the cluster (cluster config dir: {_cfg_dir}) "
+                        f"— HAProxy OpenManager does not create or distribute pattern files. "
+                        f"A missing file fails safely at 'haproxy -c' (previous config keeps "
+                        f"running)."
+                    )
         except Exception as _spoe_adv_err:
             logger.warning(f"SPOE advisory generation skipped: {_spoe_adv_err}")
 

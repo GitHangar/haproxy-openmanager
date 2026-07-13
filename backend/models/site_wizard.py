@@ -179,35 +179,17 @@ _MAX_RULE_STRING_LEN = 4096
 # attempts.
 _DANGEROUS_RULE_PATTERNS = ("$(", "`")
 
-# Phase K Phase D follow-up (Bulgu #12 round 3) — the HAProxy `-f
-# <file>` ACL/condition flag instructs HAProxy to load match patterns
-# from a server-side file at parse time. HAProxy OpenManager is a
-# fully-managed product: we do NOT provision pattern files onto the
-# HAProxy node's filesystem, and operators have no UI to upload one.
-# A `-f /some/path` reference therefore ALWAYS resolves to
-# "file not found" when HAProxy's real `-c` parse runs at apply
-# time, producing exactly the operator-reported failure mode:
-#   [ALERT] parsing ACL 'acl1' : failed to open pattern file </path>.
-#   [ALERT] parsing switching rule : no such ACL : 'acl1'.
-#
-# Surface this BEFORE persist by rejecting `-f` in any rule string
-# that comes through the wizard / manual frontend API. Reject ALL
-# variants (` -f `, leading `-f `, trailing `... -f`) defensively so
-# operators cannot slip the flag through with creative spacing.
-# The check is anchored to ACL/condition rule strings only; raw
-# HAProxy snippet fields (tcp_request_rules, request_headers, ...)
-# are NOT touched because those are inherently free-form and
-# advanced operators may legitimately reference pre-provisioned
-# pattern files there.
-_ACL_FILE_FLAG_PATTERN = re.compile(r"(^|\s)-f(\s|$)")
-_ACL_FILE_FLAG_MESSAGE = (
-    "pattern-file references with '-f <file>' are not supported in ACL / "
-    "use_backend / redirect rules: HAProxy OpenManager does not provision "
-    "pattern files onto the HAProxy node's filesystem, so the reference "
-    "would always fail at HAProxy reload time. Use inline values "
-    "instead (e.g. `acl is_admin src 10.0.0.0/24` rather than "
-    "`acl is_admin src -f /etc/haproxy/admins.lst`)."
-)
+# Issue #38 follow-up — the HAProxy `-f <file>` ACL/condition flag
+# loads match patterns from a file on the HAProxy host. The Bulgu #12
+# hard reject (`_ACL_FILE_FLAG_PATTERN`/`_ACL_FILE_FLAG_MESSAGE`) was
+# removed: pattern files are operator-managed host files (exactly like
+# the SPOE `filter ... config <path>` reference preserved since
+# v1.8.8), bulk import and the free-form fields (tcp_request_rules,
+# request_headers) always accepted them, and the agent runs
+# `haproxy -c` before every reload so a missing file fails safely
+# (the previous config keeps running). The manual frontend route
+# handlers emit a non-blocking warning listing referenced pattern
+# files (`routers/frontend.py::_pattern_file_warnings`).
 
 # Phase K Phase D follow-up (Bulgu #13) — detect a routing /
 # redirect rule whose condition references the SAME ACL in both
@@ -305,13 +287,10 @@ def _validate_haproxy_directive_string(
                 f"{field_label} entry contains potentially dangerous content: "
                 f"{pattern!r}"
             )
-    # Phase K Phase D follow-up (Bulgu #12 round 3) — reject the
-    # HAProxy `-f <file>` pattern-file flag because OpenManager does
-    # not manage the HAProxy node filesystem. See the module-level
-    # `_ACL_FILE_FLAG_PATTERN` docstring for the full operator-
-    # reported failure mode this guards against.
-    if _ACL_FILE_FLAG_PATTERN.search(stripped):
-        raise ValueError(f"{field_label}: {_ACL_FILE_FLAG_MESSAGE}")
+    # Issue #38 follow-up — `-f <file>` pattern-file references are
+    # ACCEPTED (Bulgu #12 hard reject removed; see the module-level
+    # `_ACL_FILE_FLAG_PATTERN` comment). The route handlers surface
+    # a non-blocking pattern-file warning instead.
     # Phase K Phase D follow-up (Bulgu #13) — for routing /
     # redirect rules (not ACL definitions themselves), reject a
     # condition that contains the same ACL in both positive and
@@ -1083,21 +1062,12 @@ class FrontendStep(BaseModel):
         normalised: List[Union[str, dict]] = []
         for el in v:
             if isinstance(el, dict):
-                # Phase K Phase D follow-up (Bulgu #12 round 3
-                # extension) — dict-shaped redirect rules emit their
-                # `condition` / `target` fields VERBATIM into the
-                # rendered HAProxy directive. A dict with
-                # `condition: "if { src -f /etc/haproxy/x.lst }"`
-                # would slip past the string-only validator above
-                # and trigger the same operator-reported "failed to
-                # open pattern file" rejection at apply time. Reject
-                # `-f` in any string-shaped value the dict carries.
-                for field_name in ("condition", "target", "type"):
-                    val = el.get(field_name)
-                    if isinstance(val, str) and _ACL_FILE_FLAG_PATTERN.search(val):
-                        raise ValueError(
-                            f"redirect_rules.{field_name}: {_ACL_FILE_FLAG_MESSAGE}"
-                        )
+                # Issue #38 follow-up — dict-shaped redirect rules may
+                # carry `-f <file>` pattern-file references in their
+                # `condition`/`target` values; these are ACCEPTED now
+                # (Bulgu #12 hard reject removed — operator-managed
+                # host files, fail-safe apply; see module-level
+                # `_ACL_FILE_FLAG_PATTERN` comment).
                 # Bulgu #13 extension — same contradiction guard
                 # for dict-shaped redirect conditions.
                 cond_val = el.get("condition")

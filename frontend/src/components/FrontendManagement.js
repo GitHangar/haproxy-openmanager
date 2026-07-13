@@ -866,31 +866,13 @@ const FrontendManagement = () => {
       return;
     }
 
-    // Phase K Phase D follow-up (Bulgu #12 round 3) — hard-gate any
-    // ACL / use_backend / redirect rule that carries the unsupported
-    // HAProxy `-f <file>` pattern-file flag. The Pydantic validator
-    // on the backend (`models/frontend.py::validate_acl_rules`)
-    // rejects the same shape; blocking here surfaces the error
-    // immediately at the manual frontend form and matches the wizard
-    // gate so operators see consistent behaviour between the two
-    // entry points.
-    const FILE_FLAG_RE = /(?:^|\s)-f(?:\s|$)/;
-    const aclRulesAll = [
-      ...(aclBuilderData.aclRules || []),
-      ...(aclBuilderData.useBackendRules || []),
-      ...(aclBuilderData.redirectRules || []).map(
-        (r) => (typeof r === 'string' ? r : ''),
-      ),
-    ];
-    if (aclRulesAll.some((r) => typeof r === 'string' && FILE_FLAG_RE.test(r))) {
-      message.error(
-        'One or more ACL / routing / redirect rules use the unsupported HAProxy ' +
-        '`-f <file>` pattern-file flag. HAProxy OpenManager does not provision ' +
-        'pattern files onto the HAProxy node filesystem, so the reference would ' +
-        'fail at reload time. Remove the `-f` flag and use inline values instead.'
-      );
-      return;
-    }
+    // Issue #38 follow-up — the Bulgu #12 client-side hard gate for
+    // the ACL `-f <file>` pattern-file flag was removed together with
+    // the server-side Pydantic rejects: pattern files are operator-
+    // managed host files (same policy as SPOE filter configs since
+    // v1.8.8) and the agent's pre-reload `haproxy -c` makes a missing
+    // file fail safely. The server response now carries a non-blocking
+    // warning listing the referenced files (rendered below).
 
     // Phase K Phase D follow-up (Bulgu #13) — gate for
     // self-contradictory routing / redirect conditions (`X !X`).
@@ -1182,8 +1164,31 @@ const FrontendManagement = () => {
         } else {
           message.success('Frontend created successfully');
         }
+
+        // Issue #38 follow-up — surface server-emitted warnings on
+        // CREATE too (e.g. the `-f <file>` pattern-file advisory).
+        // Mirrors the update-branch rendering above.
+        const createWarnings = Array.isArray(response.data?.warnings)
+          ? response.data.warnings
+          : [];
+        if (createWarnings.length > 0) {
+          message.warning(
+            <div>
+              <div><strong>Frontend saved, but the server flagged {createWarnings.length} rule warning(s):</strong></div>
+              <div style={{ marginTop: 6, fontSize: '12px', fontFamily: 'monospace' }}>
+                {createWarnings.slice(0, 5).map((w, i) => (
+                  <div key={i}>• {w.length > 240 ? `${w.slice(0, 237)}...` : w}</div>
+                ))}
+                {createWarnings.length > 5 && (
+                  <div>(+{createWarnings.length - 5} more)</div>
+                )}
+              </div>
+            </div>,
+            10,
+          );
+        }
       }
-      
+
       setModalVisible(false);
       fetchFrontends();
       fetchSSLCertificates(); // Refresh SSL certificates after frontend update

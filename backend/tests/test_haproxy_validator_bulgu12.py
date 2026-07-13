@@ -206,41 +206,38 @@ def test_module_level_validate_haproxy_config_forwards_partial_fragment():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Wizard Pydantic gate: ACL `-f` flag must be REJECTED at submit.
+# Issue #38 follow-up: ACL `-f <file>` pattern-file references are
+# ACCEPTED (the Bulgu #12 hard reject was removed — pattern files are
+# operator-managed host files, the agent's pre-reload `haproxy -c`
+# makes a missing file fail safely, and bulk import always accepted
+# `-f`). These tests pin the ACCEPT behaviour.
 # ──────────────────────────────────────────────────────────────────────
 
 
-def test_wizard_pydantic_rejects_acl_with_file_flag():
-    """Pre-fix the wizard's ACL string validator passed
-    `acl name path -i -m reg -f /path` straight through. Apply-time
-    HAProxy `-c` then failed with "failed to open pattern file".
-    Pin that the validator now rejects `-f` at submit.
+def test_wizard_pydantic_accepts_acl_with_file_flag():
+    """Issue #38 follow-up — the wizard's ACL string validator must
+    ACCEPT `-f <file>` pattern-file references (Bulgu #12 reject
+    removed). Operators with large host-managed IP blacklists rely
+    on this in production.
     """
     from models.site_wizard import FrontendStep
 
-    # Minimal valid wizard frontend kwargs — only the offending
-    # acl_rules entry should trigger the failure.
-    fe_kwargs = dict(
+    fe = FrontendStep(
         name="fe1",
         mode="http",
         bind_address="*",
         bind_port=80,
         acl_rules=["acl1 path -i -m reg -f /path"],
     )
-    from pydantic import ValidationError
-    with pytest.raises(ValidationError) as exc_info:
-        FrontendStep(**fe_kwargs)
-    msg = str(exc_info.value)
-    assert "-f" in msg or "pattern-file" in msg.lower(), (
-        f"Bulgu #12 regression: ACL -f flag must be rejected with a "
-        f"clear pattern-file error. Got: {msg}"
+    assert fe.acl_rules == ["acl1 path -i -m reg -f /path"], (
+        "ACL `-f` rule must round-trip verbatim through the wizard model"
     )
 
 
 @pytest.mark.parametrize(
     "rule",
     [
-        # Various spacing / position variants the regex must catch.
+        # Various spacing / position variants must all be accepted.
         "acl1 path -f /etc/haproxy/list",
         "acl1 path -i -f /tmp/x.lst",
         "acl1 src -f /etc/haproxy/admins.lst",
@@ -249,23 +246,19 @@ def test_wizard_pydantic_rejects_acl_with_file_flag():
         "acl1 path -f",
     ],
 )
-def test_wizard_pydantic_rejects_acl_with_file_flag_variants(rule):
-    """Every spacing / position variant the operator might type must
-    be rejected. Pinned defensively so the regex never accidentally
-    relaxes to "only matches trailing -f".
-    """
+def test_wizard_pydantic_accepts_acl_with_file_flag_variants(rule):
+    """Every spacing / position variant must be accepted verbatim
+    (Issue #38 follow-up — no `-f` shape may be rejected)."""
     from models.site_wizard import FrontendStep
-    from pydantic import ValidationError
 
-    fe_kwargs = dict(
+    fe = FrontendStep(
         name="fe1",
         mode="http",
         bind_address="*",
         bind_port=80,
         acl_rules=[rule],
     )
-    with pytest.raises(ValidationError):
-        FrontendStep(**fe_kwargs)
+    assert fe.acl_rules == [rule]
 
 
 def test_wizard_pydantic_does_not_falsely_match_dash_f_inside_token():
@@ -291,42 +284,29 @@ def test_wizard_pydantic_does_not_falsely_match_dash_f_inside_token():
     assert len(fe.acl_rules) == 3
 
 
-def test_manual_frontend_validator_rejects_acl_with_file_flag():
-    """Parity check: the manual Frontend API
-    (`models/frontend.py::validate_acl_rules`) must apply the same
-    `-f` rejection. Operators see consistent behaviour from both the
-    wizard and the per-entity frontend page.
+def test_manual_frontend_validator_accepts_acl_with_file_flag():
+    """Parity check (Issue #38 follow-up): the manual Frontend API
+    (`models/frontend.py::validate_acl_rules`) must ACCEPT `-f`
+    pattern-file references, same as the wizard and bulk import.
     """
     from models.frontend import FrontendConfig
-    from pydantic import ValidationError
 
-    with pytest.raises(ValidationError) as exc_info:
-        FrontendConfig(
-            name="fe1",
-            bind_port=80,
-            mode="http",
-            acl_rules=["acl1 path -i -m reg -f /path"],
-        )
-    msg = str(exc_info.value)
-    assert "-f" in msg or "pattern-file" in msg.lower(), (
-        f"Manual frontend API parity regression: ACL -f flag must be "
-        f"rejected. Got: {msg}"
+    fe = FrontendConfig(
+        name="fe1",
+        bind_port=80,
+        mode="http",
+        acl_rules=["acl1 path -i -m reg -f /path"],
     )
+    assert fe.acl_rules == ["acl1 path -i -m reg -f /path"]
 
 
-def test_wizard_pydantic_rejects_structured_redirect_dict_with_file_flag():
-    """Round-3 audit extension — structured redirect dicts (the
-    alternative shape that `models/site_wizard.py::_validate_redirect_rules`
-    accepts alongside legacy strings) also flow through to
-    `services/haproxy_config.py::_format_redirect_rule` and emit
-    their `condition` / `target` verbatim into the rendered HAProxy
-    directive. Without the dict-aware reject the visual builder's
-    `-f` block could be bypassed by hand-crafting a dict payload
-    against the API — recreating the same `failed to open pattern
-    file` failure at apply time.
+def test_wizard_pydantic_accepts_structured_redirect_dict_with_file_flag():
+    """Issue #38 follow-up — structured redirect dicts carrying `-f`
+    pattern-file references in `condition`/`target` are ACCEPTED
+    (the Bulgu #12 dict-aware reject was removed together with the
+    string-rule reject).
     """
-    from models.site_wizard import FrontendStep, BackendStep
-    from pydantic import ValidationError
+    from models.site_wizard import FrontendStep
 
     fe_kwargs = dict(
         name="fe1",
@@ -334,37 +314,32 @@ def test_wizard_pydantic_rejects_structured_redirect_dict_with_file_flag():
         mode="http",
     )
 
-    # `condition` carrying `-f` must be rejected.
-    with pytest.raises(ValidationError) as exc_info:
-        FrontendStep(
-            **fe_kwargs,
-            redirect_rules=[
-                {
-                    "type": "scheme",
-                    "target": "https",
-                    "condition": "if { src -f /etc/haproxy/admins.lst }",
-                }
-            ],
-        )
-    msg = str(exc_info.value)
-    assert "pattern-file" in msg.lower() or "-f" in msg, msg
+    # `condition` carrying `-f` is accepted.
+    fe = FrontendStep(
+        **fe_kwargs,
+        redirect_rules=[
+            {
+                "type": "scheme",
+                "target": "https",
+                "condition": "if { src -f /etc/haproxy/admins.lst }",
+            }
+        ],
+    )
+    assert fe.redirect_rules[0]["condition"] == "if { src -f /etc/haproxy/admins.lst }"
 
-    # `target` carrying `-f` must also be rejected (defence-in-depth
-    # for hand-crafted payloads).
-    with pytest.raises(ValidationError) as exc_info:
-        FrontendStep(
-            **fe_kwargs,
-            redirect_rules=[
-                {
-                    "type": "location",
-                    "target": "/foo -f /tmp/x.lst",
-                }
-            ],
-        )
-    msg = str(exc_info.value)
-    assert "pattern-file" in msg.lower() or "-f" in msg, msg
+    # `target` carrying `-f` is accepted too.
+    fe = FrontendStep(
+        **fe_kwargs,
+        redirect_rules=[
+            {
+                "type": "location",
+                "target": "/foo -f /tmp/x.lst",
+            }
+        ],
+    )
+    assert fe.redirect_rules[0]["target"] == "/foo -f /tmp/x.lst"
 
-    # Clean structured dict still passes — no false positive.
+    # Clean structured dict still passes.
     FrontendStep(
         **fe_kwargs,
         redirect_rules=[
@@ -667,8 +642,8 @@ def test_user_reported_wizard_config_emits_no_false_warnings():
     zero WARNINGs from the directives we expanded.
     """
     # Distilled from the user's bulk-site-create snapshot, minus the
-    # `-f` ACL (which the new Pydantic gate rejects before this
-    # validator ever runs).
+    # `-f` ACL (accepted since the Issue #38 follow-up, but irrelevant
+    # to the directive-expansion warnings this test pins).
     config = """# ─── Wizard candidate fragment (dry-run preview) ───
 frontend fe-site1
     bind *:80

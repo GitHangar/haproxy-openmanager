@@ -117,6 +117,41 @@ def _rule_contradiction_text(rule: Any) -> Optional[str]:
     return None
 
 
+def _pattern_file_warnings(
+    acl_rules: Optional[List[Any]] = None,
+    use_backend_rules: Optional[List[Any]] = None,
+    redirect_rules: Optional[List[Any]] = None,
+) -> List[str]:
+    """Issue #38 follow-up — non-blocking `-f <file>` pattern-file
+    advisory for the manual frontend API.
+
+    The Bulgu #12 hard reject was removed from the Pydantic models:
+    pattern files are operator-managed host files (same policy as the
+    SPOE `filter ... config <path>` reference preserved since v1.8.8)
+    and the agent's pre-reload `haproxy -c` makes a missing file fail
+    safely. This helper returns one warning listing the unique file
+    paths referenced across the rule fields, or [] when no rule uses
+    `-f` — operators who don't use pattern files see no change.
+    """
+    paths: List[str] = []
+    for rules in (acl_rules, use_backend_rules, redirect_rules):
+        for rule in rules or []:
+            text = rule if isinstance(rule, str) else (
+                rule.get("condition") if isinstance(rule, dict) else None)
+            if isinstance(text, str):
+                paths.extend(re.findall(r"(?:^|\s)-f\s+(\S+)", text))
+    if not paths:
+        return []
+    uniq = sorted(set(paths))
+    return [
+        f"ACL/routing rules reference pattern file(s) {', '.join(uniq)}. "
+        f"Each file must exist at that exact path on every HAProxy host "
+        f"in the cluster — HAProxy OpenManager does not create or "
+        f"distribute pattern files. A missing file fails safely at "
+        f"'haproxy -c' (the previous config keeps running)."
+    ]
+
+
 def _collect_routing_rule_contradictions(
     rules: List[Any], origin_label: str,
 ) -> List[Tuple[str, Any]]:
@@ -833,12 +868,19 @@ async def create_frontend(frontend: FrontendConfig, request: Request, authorizat
                 user_agent=request.headers.get('user-agent')
             )
         
-        return {
+        response: dict = {
             "message": f"Frontend '{frontend.name}' created successfully",
             "id": frontend_id,
             "frontend": frontend.dict(),
             "sync_results": sync_results
         }
+        # Issue #38 follow-up — non-blocking pattern-file advisory
+        # (additive field; absent when no rule references `-f`).
+        pattern_warnings = _pattern_file_warnings(
+            frontend.acl_rules, frontend.use_backend_rules, frontend.redirect_rules)
+        if pattern_warnings:
+            response["warnings"] = pattern_warnings
+        return response
     except HTTPException:
         raise
     except Exception as e:
@@ -1246,8 +1288,12 @@ async def update_frontend(frontend_id: int, frontend: FrontendConfig, request: R
         # yellow toast on the next refresh. The save SUCCEEDED; the
         # warnings only flag latent legacy data the operator may
         # want to clean up at their convenience.
-        if contradiction_warnings:
-            response["warnings"] = contradiction_warnings
+        # Issue #38 follow-up — append the pattern-file advisory to
+        # the same list (additive; empty when no rule uses `-f`).
+        all_warnings = list(contradiction_warnings or []) + _pattern_file_warnings(
+            frontend.acl_rules, frontend.use_backend_rules, frontend.redirect_rules)
+        if all_warnings:
+            response["warnings"] = all_warnings
         return response
     except HTTPException:
         raise

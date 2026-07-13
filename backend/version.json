@@ -1,5 +1,5 @@
 {
-  "version": "1.8.8",
-  "releaseName": "SPOE filter + frontend log-format support (Issue #38)",
-  "releaseDate": "2026-07-10"
+  "version": "1.8.9",
+  "releaseName": "ACL -f pattern-file support (Issue #38 follow-up)",
+  "releaseDate": "2026-07-13"
 }

@@ -3177,36 +3177,15 @@ const SiteWizard = () => {
                     );
                     return;
                   }
-                  // Phase K Phase D follow-up (Bulgu #12 round 3) —
-                  // hard-gate the Step 2 → Step 3 advance on any ACL
-                  // rule that carries the unsupported `-f <file>`
-                  // pattern-file flag. The Pydantic validator rejects
-                  // the same shape at submit, but blocking the Next
-                  // button here surfaces the error immediately at
-                  // its source step (the ACL builder is right above)
-                  // instead of bouncing the operator from Step 4's
-                  // dry-run card back to Step 2 with a less-specific
-                  // jumpback button. The ACLRuleBuilder ALSO renders
-                  // a section-level red Alert when this state is
-                  // active so the operator already sees what to fix.
-                  const FILE_FLAG_RE = /(?:^|\s)-f(?:\s|$)/;
-                  const aclRulesAll = [
-                    ...(aclBuilderData.aclRules || []),
-                    ...(aclBuilderData.useBackendRules || []),
-                    ...(aclBuilderData.redirectRules || []).map(
-                      (r) => (typeof r === 'string' ? r : ''),
-                    ),
-                  ];
-                  if (aclRulesAll.some((r) => typeof r === 'string' && FILE_FLAG_RE.test(r))) {
-                    message.error(
-                      'One or more rules use the unsupported HAProxy `-f <file>` ' +
-                      'pattern-file flag. HAProxy OpenManager does not provision ' +
-                      'pattern files onto the HAProxy node filesystem, so the ' +
-                      'reference would fail at reload time. Remove the `-f` flag ' +
-                      'and use inline values instead before continuing.'
-                    );
-                    return;
-                  }
+                  // Issue #38 follow-up — the Bulgu #12 Step 2 → 3
+                  // hard gate for the ACL `-f <file>` pattern-file
+                  // flag was removed together with the server-side
+                  // Pydantic rejects: pattern files are operator-
+                  // managed host files (same policy as SPOE filter
+                  // configs since v1.8.8) and the agent's pre-reload
+                  // `haproxy -c` makes a missing file fail safely.
+                  // The ACLRuleBuilder renders an informational note
+                  // on `-f` rules instead of a blocking error.
                   // Phase K Phase D follow-up (Bulgu #13) — block
                   // advance when any routing / redirect rule has a
                   // self-contradictory condition (`acl1 !acl1`).

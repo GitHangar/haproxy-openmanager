@@ -456,26 +456,17 @@ class FrontendConfig(BaseModel):
             if any(dangerous in rule.lower() for dangerous in ['$(', '`']):
                 raise ValueError(f'ACL rule contains potentially dangerous content: "{rule}"')
 
-            # Phase K Phase D follow-up (Bulgu #12 round 3) — reject
-            # the HAProxy `-f <file>` pattern-file flag here too so the
-            # manual Frontend API mirrors the wizard's parity rule.
-            # HAProxy OpenManager does not provision pattern files
-            # onto the HAProxy node filesystem, so any `-f /path/...`
-            # reference will fail HAProxy's `-c` parse at apply time
-            # with "failed to open pattern file". Reject up-front so
-            # operators get the same actionable error from both the
-            # manual page and the wizard.
-            if re.search(r"(^|\s)-f(\s|$)", rule):
-                raise ValueError(
-                    f'ACL rule "{rule}" uses the HAProxy `-f <file>` '
-                    "pattern-file flag, which is not supported in "
-                    "HAProxy OpenManager: the product does not "
-                    "provision pattern files onto the HAProxy node "
-                    "filesystem, so the reference would fail at "
-                    "reload time. Use inline values instead "
-                    "(e.g. `src 10.0.0.0/24` rather than "
-                    "`src -f /etc/haproxy/admins.lst`)."
-                )
+            # Issue #38 follow-up — the `-f <file>` pattern-file flag
+            # is ACCEPTED here (the Bulgu #12 hard reject was removed).
+            # Pattern files are operator-managed host files, exactly
+            # like the SPOE `filter ... config <path>` reference this
+            # release started preserving: bulk import always accepted
+            # `-f`, the free-form fields (request_headers,
+            # tcp_request_rules) always accepted it, and the agent
+            # runs `haproxy -c` before every reload so a missing file
+            # fails safely (previous config keeps running). The route
+            # handlers surface a non-blocking warning listing the
+            # referenced pattern files instead.
 
             validated_rules.append(rule)
 
@@ -515,20 +506,12 @@ class FrontendConfig(BaseModel):
             if not any(rule.startswith(redirect_type) for redirect_type in valid_redirects):
                 raise ValueError(f'Invalid redirect rule: "{rule}". Must start with: location, prefix, or scheme.')
 
-            # Phase K Phase D follow-up (Bulgu #12 round 3) —
-            # mirror the wizard's `-f <file>` guard here. The
-            # `X !X` contradiction check used to live alongside
-            # this guard, but Bulgu #62 (round-22 audit) moved
-            # it into the route handler so updates can grandfather
-            # legacy rules created before the contradiction guard
-            # landed. See `routers/frontend.py::_collect_routing_rule_contradictions`.
-            if re.search(r"(^|\s)-f(\s|$)", rule):
-                raise ValueError(
-                    f'Redirect rule "{rule}" uses the HAProxy `-f <file>` '
-                    "pattern-file flag, which is not supported in "
-                    "HAProxy OpenManager: the product does not provision "
-                    "pattern files onto the HAProxy node filesystem."
-                )
+            # Issue #38 follow-up — `-f <file>` pattern-file references
+            # are ACCEPTED (Bulgu #12 hard reject removed; see
+            # validate_acl_rules for the full rationale). The `X !X`
+            # contradiction check lives in the route handler
+            # (`routers/frontend.py::_collect_routing_rule_contradictions`,
+            # Bulgu #62) and is unchanged.
 
             validated_rules.append(rule)
 
@@ -536,9 +519,12 @@ class FrontendConfig(BaseModel):
 
     @validator('use_backend_rules')
     def validate_use_backend_rules_syntax(cls, v):
-        """Phase K Phase D follow-up (Bulgu #12 round 3) — manual
-        Frontend API parity guard: reject `-f <file>` references
-        and dangerous shell patterns.
+        """Manual Frontend API guard for dangerous shell patterns.
+
+        Issue #38 follow-up — the Bulgu #12 `-f <file>` hard reject
+        was removed (see validate_acl_rules for the rationale);
+        pattern-file references are operator-managed host files and
+        are surfaced as non-blocking warnings by the route handlers.
 
         Bulgu #62 (round-22 audit) — the `X !X` contradiction check
         previously lived here but moved into the route handler so
@@ -567,14 +553,6 @@ class FrontendConfig(BaseModel):
                 raise ValueError(
                     f'use_backend rule contains potentially dangerous '
                     f'content: "{rule}"'
-                )
-            if re.search(r"(^|\s)-f(\s|$)", rule):
-                raise ValueError(
-                    f'use_backend rule "{rule}" uses the HAProxy '
-                    "`-f <file>` pattern-file flag, which is not "
-                    "supported in HAProxy OpenManager: the product "
-                    "does not provision pattern files onto the HAProxy "
-                    "node filesystem."
                 )
             validated_rules.append(rule)
         return validated_rules
